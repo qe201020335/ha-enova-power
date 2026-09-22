@@ -19,12 +19,16 @@ from custom_components.enova_power.const import (
 )
 import custom_components.enova_power.statistics as statistics_module
 from custom_components.enova_power.statistics import (
+    ImportResult,
+    SeriesResult,
+    SeriesScan,
     TieredRates,
     _async_import_series,
     _cycle_key,
     _merge_statistics,
     _missing_series,
     _period_hourly,
+    _scan_series,
     _tier_hourly,
     bucket_cost_points,
     bucket_cost_statistic_id,
@@ -38,6 +42,7 @@ from custom_components.enova_power.statistics import (
     days_covered,
     download_window,
     expected_statistic_ids,
+    find_sum_drops,
     plan_prices,
     rebuild_statistic_ids,
     season_threshold,
@@ -351,12 +356,12 @@ async def test_import_series_fresh_ignores_stored_rows(
     written = _patch_import(monkeypatch, {"start": base.replace(hour=7), "sum": 500.0})
     points = [(base, 1.0), (base.replace(hour=6), 2.0)]
 
-    total = await _async_import_series(
+    result = await _async_import_series(
         None, "enova_power:x", "x", points, "kWh",
         window=WINDOW, covered_days={JAN1}, fresh=True,
     )
 
-    assert total == 3.0
+    assert result == SeriesResult(3.0, [])  # nothing read → nothing checked
     assert [s["sum"] for s in written] == [1.0, 3.0]
 
 
@@ -379,7 +384,7 @@ async def test_import_meter_rebuild_reimports_everything(
     )
 
     readings = [_reading(date(2026, 6, 1), h01=10.0, h13=5.0)]
-    total = await statistics_module.async_import_meter(
+    result = await statistics_module.async_import_meter(
         None, "111", readings, PLAN_TOU, TOU_RATES, None, [], "CAD",
         window=download_window(date(2026, 6, 1), date(2026, 6, 1)),
         covered_days=days_covered(readings),
@@ -389,7 +394,7 @@ async def test_import_meter_rebuild_reimports_everything(
     # Every series — consumption included (its timestamps moved in v3) —
     # ignores the stale row (no stored-rows read either): full points, sums
     # restarting from zero.
-    assert total == 15.0
+    assert result == ImportResult(15.0, {})
     assert written[consumption_statistic_id("111")] == [10.0, 15.0]
     assert written[bucket_statistic_id("111", "tou_off_peak")] == [10.0]
     assert written[bucket_cost_statistic_id("111", "tou_on_peak")] == pytest.approx([1.015])
@@ -568,10 +573,15 @@ def _patch_import(
     return written
 
 
-async def _import(points, **kwargs) -> float | None:
+async def _import_result(points, **kwargs) -> SeriesResult:
     kwargs.setdefault("window", WINDOW)
     kwargs.setdefault("covered_days", {JAN1})
     return await _async_import_series(None, "enova_power:x", "x", points, "kWh", **kwargs)
+
+
+async def _import(points, **kwargs) -> float | None:
+    """The cumulative total ``_async_import_series`` reports."""
+    return (await _import_result(points, **kwargs)).total
 
 
 async def test_import_series_returns_cumulative_total(
@@ -735,13 +745,13 @@ async def test_import_meter_writes_bucket_costs(
     rates = TOU_RATES + TIER_RATES
     tiered = tiered_rates(TIER_RATES)
     readings = [_reading(date(2026, 6, 1), h01=10.0, h13=5.0)]
-    total = await statistics_module.async_import_meter(
+    result = await statistics_module.async_import_meter(
         None, "111", readings, PLAN_TOU, rates, tiered, [], "CAD",
         window=download_window(date(2026, 6, 1), date(2026, 6, 1)),
         covered_days=days_covered(readings),
     )
 
-    assert total == 15.0
+    assert result == ImportResult(15.0, {})
     assert written[consumption_statistic_id("111")] == "kWh"
     assert written[bucket_cost_statistic_id("111", "tou_off_peak")] == "CAD"
     assert written[bucket_cost_statistic_id("111", "tou_on_peak")] == "CAD"
@@ -762,7 +772,7 @@ async def _imported_ids(monkeypatch: pytest.MonkeyPatch, plan, rates, tiered) ->
 
     async def fake_import_series(hass, statistic_id, name, points, unit, **kwargs):
         imported.add(statistic_id)
-        return None
+        return SeriesResult(None, [])
 
     async def fake_stored_rows(hass, statistic_ids, start):
         return {}
@@ -821,3 +831,145 @@ async def test_import_meter_batches_one_stored_rows_read(
     assert len(reads) == 1
     assert reads[0] == (set(expected_statistic_ids("111", PLAN_TOU, TOU_RATES, None)), window[0])
     assert written
+
+
+# --- integrity check (pure) ---------------------------------------------------- #
+
+
+async def test_DW_2_1_find_sum_drops_clean_and_single_drop() -> None:
+    # A flat hour (equal sums) is fine; only a fall counts.
+    assert find_sum_drops([(_utc(5), 1.0), (_utc(6), 1.0), (_utc(7), 2.5)]) == []
+    # The July pattern: a day re-imported on a stale base falls below its
+    # predecessor — reported at the hour the sum falls, once.
+    broken = [(_utc(5), 100.0), (_utc(6), 101.0), (_utc(7), 1.0), (_utc(8), 2.0)]
+    assert find_sum_drops(broken) == [_utc(7)]
+
+
+async def test_DW_2_1_find_sum_drops_ignores_negative_zero_and_tolerance() -> None:
+    assert find_sum_drops([(_utc(5), 0.0), (_utc(6), -0.0)]) == []
+    # Exactly at the tolerance is float noise; just above it is a drop.
+    assert find_sum_drops([(_utc(5), 1.0), (_utc(6), 1.0 - 1e-6)]) == []
+    assert find_sum_drops([(_utc(5), 1.0), (_utc(6), 1.0 - 2e-6)]) == [_utc(6)]
+    assert find_sum_drops([(_utc(5), 1.0), (_utc(6), 0.5)], tolerance=1.0) == []
+
+
+async def test_DW_2_1_find_sum_drops_empty_and_single_row() -> None:
+    assert find_sum_drops([]) == []
+    assert find_sum_drops([(_utc(5), 7.0)]) == []
+
+
+async def test_DW_2_1_find_sum_drops_first_row_vs_anchor() -> None:
+    # Without the anchor the chain starts at the first stored row (nothing to
+    # compare); with it, a first row below the anchor's sum is the drop.
+    anchor = (_utc(4), 50.0)
+    stored = [(_utc(5), 1.0), (_utc(6), 2.0)]
+    assert find_sum_drops(stored) == []
+    assert find_sum_drops([anchor, *stored]) == [_utc(5)]
+
+
+async def test_find_sum_drops_reports_every_drop() -> None:
+    rows = [(_utc(5), 10.0), (_utc(6), 4.0), (_utc(7), 9.0), (_utc(8), 3.0)]
+    assert find_sum_drops(rows) == [_utc(6), _utc(8)]
+
+
+async def test_scan_series_full_history_per_series(monkeypatch: pytest.MonkeyPatch) -> None:
+    asked: list = []
+
+    def fake_during_period(hass, start, end, ids, period, units, types):
+        asked.append((start, end, ids))
+        return {
+            "enova_power:a": [
+                {"start": _utc(6).timestamp(), "sum": 5.0},
+                {"start": _utc(5).timestamp(), "sum": 1.0},
+                {"start": _utc(7).timestamp(), "sum": 2.0},  # falls below 5.0
+            ],
+        }
+
+    monkeypatch.setattr(statistics_module, "statistics_during_period", fake_during_period)
+    scans = _scan_series(None, ["enova_power:a", "enova_power:b"])
+    # Sorted before checking; a series with no rows scans clean with no first hour.
+    assert scans == {
+        "enova_power:a": SeriesScan(first_start=_utc(5), drops=[_utc(7)]),
+        "enova_power:b": SeriesScan(first_start=None, drops=[]),
+    }
+    # One batched full-history read for every requested id.
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    assert asked == [(epoch, None, {"enova_power:a", "enova_power:b"})]
+
+
+# --- integrity check inside the import ----------------------------------------- #
+
+
+async def test_import_series_reports_drop_from_anchor_and_heals_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The July pattern inside the window: stored rows re-based on zero after an
+    # anchor at 100. The pre-write read reports the drop; the rewrite itself
+    # puts the chain back on the anchor.
+    anchor = {"start": _utc(4), "sum": 100.0}
+    stale = [(_utc(5), 1.0), (_utc(6), 2.0)]
+    written = _patch_import(monkeypatch, None, anchor=anchor, stored=stale)
+
+    result = await _import_result([(_utc(5), 2.0), (_utc(6), 3.0)])
+
+    assert result == SeriesResult(105.0, [_utc(5)])
+    assert [s["sum"] for s in written] == [102.0, 105.0]
+
+
+async def test_import_series_reports_drop_even_when_nothing_is_written(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # No points and uncovered rows → no write, but the check still ran.
+    anchor = {"start": _utc(4), "sum": 10.0}
+    stored = [(_utc(5), 12.0), (_utc(6), 3.0)]
+    written = _patch_import(monkeypatch, None, anchor=anchor, stored=stored)
+    assert await _import_result([], covered_days=set()) == SeriesResult(3.0, [_utc(6)])
+    assert written == []
+
+
+async def test_import_series_overlap_without_anchor_checks_stored_rows_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_import(monkeypatch, None, anchor=None, stored=[(_utc(5), 24.0), (_utc(6), 25.0)])
+    assert (await _import_result([(_utc(5), 1.0)])).drops == []
+    _patch_import(monkeypatch, None, anchor=None, stored=[(_utc(5), 24.0), (_utc(6), 2.0)])
+    assert (await _import_result([(_utc(5), 1.0)])).drops == [_utc(6)]
+
+
+async def test_import_series_anchor_without_usable_start_is_not_compared(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The anchor's sum still bases the chain, but with no start it can't be a
+    # row in the check.
+    _patch_import(monkeypatch, None, anchor={"start": None, "sum": 100.0}, stored=[(_utc(5), 1.0)])
+    assert await _import_result([(_utc(5), 2.0)]) == SeriesResult(102.0, [])
+
+
+async def test_import_series_append_path_reports_no_drops(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Nothing overlapping was read, so there is nothing to check.
+    _patch_import(monkeypatch, {"start": _utc(4), "sum": 10.0})
+    assert await _import_result([(_utc(6), 2.0)]) == SeriesResult(12.0, [])
+
+
+async def test_import_meter_maps_broken_series_to_drop_times(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    jun1 = datetime(2026, 6, 1, 4, tzinfo=timezone.utc)  # 00:00 EDT
+    consumption = consumption_statistic_id("111")
+    _patch_import(monkeypatch, None, anchor={"start": jun1.replace(hour=3), "sum": 100.0})
+
+    async def fake_stored_rows(hass, statistic_ids, start):
+        # Only consumption has stored rows in the window — re-based on zero.
+        return {consumption: [(jun1, 10.0)]}
+
+    monkeypatch.setattr(statistics_module, "_async_stored_rows", fake_stored_rows)
+    readings = [_reading(date(2026, 6, 1), h01=10.0, h13=5.0)]
+    result = await statistics_module.async_import_meter(
+        None, "111", readings, PLAN_TOU, TOU_RATES, None, [], "CAD",
+        window=download_window(date(2026, 6, 1), date(2026, 6, 1)),
+        covered_days=days_covered(readings),
+    )
+    # Broken series only, keyed by id; the total is still the healed chain's end.
+    assert result == ImportResult(115.0, {consumption: [jun1]})

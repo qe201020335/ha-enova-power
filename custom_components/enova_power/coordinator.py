@@ -38,6 +38,7 @@ from .const import (
     LOGGER,
     PLAN_TIERED,
     RECENT_DAYS,
+    TIME_ZONE,
     UPDATE_INTERVAL,
 )
 from .statistics import (
@@ -46,6 +47,7 @@ from .statistics import (
     async_import_meter,
     async_last_statistic_start,
     async_missing_series,
+    async_scan_series,
     consumption_statistic_id,
     cost_total,
     days_covered,
@@ -117,6 +119,11 @@ def cycle_start_containing(periods: list[BillingPeriod], d: date) -> date:
     return month_start
 
 
+def _drop_set(broken: dict[str, list[datetime]]) -> set[tuple[str, datetime]]:
+    """Flatten ``{statistic_id: [drop hours]}`` into ``(statistic_id, hour)`` pairs."""
+    return {(statistic_id, start) for statistic_id, starts in broken.items() for start in starts}
+
+
 class EnovaPowerCoordinator(DataUpdateCoordinator[dict[str, "MeterData"]]):
     """Coordinate Enova Power downloads and statistics imports (per meter)."""
 
@@ -144,6 +151,17 @@ class EnovaPowerCoordinator(DataUpdateCoordinator[dict[str, "MeterData"]]):
         # (and the flag dropped) only after a fully successful cycle, so any
         # failure retries the whole rebuild idempotently.
         self._rebuild = entry.data.get(CONF_STATS_VERSION, 1) < STATS_VERSION
+        # Statistics integrity (see ``_download_from``): a cumulative sum that
+        # falls means stored history is broken; the fix is a full re-import
+        # from the meter's oldest stored date, at most once per meter per day.
+        self._scanned: set[str] = set()  # meters whose startup scan has run
+        self._oldest: dict[str, date] = {}  # meter → oldest stored local date
+        self._heal_pending: set[str] = set()  # meters awaiting a full re-import
+        self._last_heal: dict[str, date] = {}  # meter → day of its last heal
+        # meter → the (statistic id, hour) drops present when it was last healed
+        self._pre_heal: dict[str, set[tuple[str, datetime]]] = {}
+        # drops that survived a heal: logged as ERROR once, never healed again
+        self._unhealable: set[tuple[str, datetime]] = set()
 
     def plan_override(self) -> str | None:
         """Account-wide plan override (options, or a legacy configured value)."""
@@ -196,44 +214,11 @@ class EnovaPowerCoordinator(DataUpdateCoordinator[dict[str, "MeterData"]]):
         except EnovaError as err:
             LOGGER.warning("Could not fetch billing cycles for %s: %s", meter_id, err)
             periods = []
+        ids = expected_statistic_ids(meter_id, plan, self.rates, tiered)
 
-        cycle_start = current_cycle_start(periods, today)
-        if self._rebuild:
-            # Format rebuild: full backfill window, and skip the missing-series
-            # check — the queued clear may not have run yet, so stored rows
-            # can't be trusted either way (the fresh imports ignore them).
-            last_start = None
-        else:
-            last_start = await async_last_statistic_start(
-                self.hass, consumption_statistic_id(meter_id)
-            )
-            if last_start is not None:
-                # Imports are forward-only, so a series added by an upgrade can
-                # only get history older than its first point from a full
-                # refetch now.
-                missing = await async_missing_series(
-                    self.hass, expected_statistic_ids(meter_id, plan, self.rates, tiered)
-                )
-                if missing:
-                    LOGGER.info(
-                        "Meter %s gained %d statistics series; refetching full "
-                        "history once to backfill them",
-                        meter_id,
-                        len(missing),
-                    )
-                    last_start = None
-        # Always cover the whole current cycle so cycle-to-date and tier
-        # accumulation are correct, then snap back to the start of the billing
-        # cycle the window begins in so the tier split is computed on whole
-        # cycles (when a bill posts, this reaches back over the newly closed
-        # cycle once, rewriting its month-keyed split as cycle-keyed).
-        from_date = min(fetch_from_date(last_start, today), cycle_start)
-        from_date = cycle_start_containing(periods, from_date)
-        if last_start is None:
-            LOGGER.debug("No prior statistics for %s; backfilling from %s", meter_id, from_date)
-
+        from_date, healing = await self._download_from(meter_id, ids, periods, today)
         readings = await self.client.download_usage(from_date, today, meter_id=meter_id)
-        lifetime = await async_import_meter(
+        result = await async_import_meter(
             self.hass,
             meter_id,
             readings,
@@ -246,7 +231,12 @@ class EnovaPowerCoordinator(DataUpdateCoordinator[dict[str, "MeterData"]]):
             covered_days=days_covered(readings),
             rebuild=self._rebuild,
         )
+        if healing:
+            self._finish_heal(meter_id, result.broken, today)
+        else:
+            self._record_drops(meter_id, result.broken, today)
 
+        cycle_start = current_cycle_start(periods, today)
         cycle = [r for r in readings if r.date >= cycle_start]
         return MeterData(
             latest=max(readings, key=lambda r: r.date) if readings else None,
@@ -255,7 +245,151 @@ class EnovaPowerCoordinator(DataUpdateCoordinator[dict[str, "MeterData"]]):
             cycle_cost=cost_total(cycle, plan, self.rates, tiered, periods) if cycle else None,
             last_bill=max(periods, key=lambda p: p.end_date) if periods else None,
             threshold=season_threshold(today) if plan == PLAN_TIERED else None,
-            lifetime_energy=lifetime,
+            lifetime_energy=result.total,
+        )
+
+    async def _download_from(
+        self, meter_id: str, ids: list[str], periods: list[BillingPeriod], today: date
+    ) -> tuple[date, bool]:
+        """This cycle's download start date, and whether it is a heal cycle.
+
+        The start is the earliest of every trigger — the recent/current-cycle
+        window, a full backfill when a series is missing, and the meter's
+        oldest stored date when it is being healed — then snapped back to the
+        start of the billing cycle it falls in, so the tier split is computed
+        on whole cycles (when a bill posts, this reaches back over the newly
+        closed cycle once, rewriting its month-keyed split as cycle-keyed).
+
+        A heal is due when one is pending and the meter was not already
+        healed today; drops found by the startup scan are healed right away.
+        """
+        if self._rebuild:
+            # Format rebuild: full backfill window, and skip the recorder checks
+            # — the queued clear may not have run yet, so stored rows can't be
+            # trusted either way (the fresh imports ignore them).
+            last_start, healing = None, False
+        else:
+            last_start = await self._incremental_start(meter_id, ids)
+            if meter_id not in self._scanned:
+                await self._startup_scan(meter_id, ids)
+            healing = meter_id in self._heal_pending and self._last_heal.get(meter_id) != today
+
+        from_date = min(fetch_from_date(last_start, today), current_cycle_start(periods, today))
+        if healing:
+            heal_from = await self._full_reimport_from(meter_id)
+            from_date = min(from_date, heal_from or fetch_from_date(None, today))
+            LOGGER.info(
+                "Meter %s: re-importing its full history from %s to heal its statistics",
+                meter_id,
+                from_date,
+            )
+        return cycle_start_containing(periods, from_date), healing
+
+    async def _incremental_start(self, meter_id: str, ids: list[str]) -> datetime | None:
+        """The newest stored consumption hour, or None to backfill full history.
+
+        None when nothing is stored yet, or when a series added by an upgrade
+        has no rows: imports never reach behind a series' first point on
+        their own, so it can only get its history from a full refetch now.
+        """
+        last_start = await async_last_statistic_start(
+            self.hass, consumption_statistic_id(meter_id)
+        )
+        if last_start is None:
+            LOGGER.debug("No prior statistics for %s; backfilling", meter_id)
+            return None
+        missing = await async_missing_series(self.hass, ids)
+        if missing:
+            LOGGER.info(
+                "Meter %s gained %d statistics series; refetching full "
+                "history once to backfill them",
+                meter_id,
+                len(missing),
+            )
+            return None
+        return last_start
+
+    async def _startup_scan(self, meter_id: str, ids: list[str]) -> None:
+        """Once per meter: check every series' full history and cache the
+        meter's oldest stored date; any drop found is healed this same cycle."""
+        scan = await async_scan_series(self.hass, ids)
+        self._scanned.add(meter_id)
+        firsts = [s.first_start for s in scan.values() if s.first_start is not None]
+        if firsts:
+            self._oldest[meter_id] = min(firsts).astimezone(TIME_ZONE).date()
+        drops = _drop_set({statistic_id: s.drops for statistic_id, s in scan.items()})
+        if drops:
+            self._schedule_heal(meter_id, drops, "now")
+
+    async def _full_reimport_from(self, meter_id: str) -> date | None:
+        """Where a full re-import (a heal, or the format rebuild) starts.
+
+        The meter's oldest stored local date, so every series is rewritten
+        from its first row with no anchor; None when the startup scan found
+        no rows — the caller then uses the normal backfill window. Any cycle
+        importing from here is a heal cycle (see ``_finish_heal``).
+        """
+        return self._oldest.get(meter_id)
+
+    def _finish_heal(
+        self, meter_id: str, broken: dict[str, list[datetime]], today: date
+    ) -> None:
+        """Book-keep a completed heal cycle.
+
+        Its own check saw the pre-heal data (the read that preceded the
+        rewrite), so that drop set is kept as the pre-heal snapshot for the
+        next cycle's verdict rather than acted on: no warning, no error, no
+        re-schedule.
+        """
+        self._heal_pending.discard(meter_id)
+        self._last_heal[meter_id] = today
+        self._pre_heal[meter_id] = _drop_set(broken)
+
+    def _record_drops(
+        self, meter_id: str, broken: dict[str, list[datetime]], today: date
+    ) -> None:
+        """Act on a normal cycle's check result.
+
+        A drop that was present before the last heal and still is cannot be
+        fixed from portal data: log it as an error once and never heal it
+        again (until restart). Any other drop schedules a heal.
+        """
+        reported = _drop_set(broken)
+        persistent = (reported & self._pre_heal.pop(meter_id, set())) - self._unhealable
+        for statistic_id, start in sorted(persistent):
+            LOGGER.error(
+                "%s still has a sum drop at %s after a full re-import from the "
+                "portal; it will not be re-imported for this again until restart",
+                statistic_id,
+                start,
+            )
+        self._unhealable |= persistent
+        new = reported - self._unhealable
+        if not new:
+            return
+        # At most one heal per day: a drop found after today's heal waits.
+        when = (
+            "tomorrow (already re-imported once today)"
+            if self._last_heal.get(meter_id) == today
+            else "on the next update"
+        )
+        self._schedule_heal(meter_id, new, when)
+
+    def _schedule_heal(self, meter_id: str, drops: set[tuple[str, datetime]], when: str) -> None:
+        """Queue a full re-import of ``meter_id`` and warn once (``when`` says
+        when it will run); a no-op while one is already pending."""
+        if meter_id in self._heal_pending:
+            return
+        self._heal_pending.add(meter_id)
+        statistic_id, start = min(drops, key=lambda drop: drop[1])
+        LOGGER.warning(
+            "Meter %s: %d statistics sum drop(s) detected (first: %s at %s); "
+            "re-importing its full history %s",
+            meter_id,
+            len(drops),
+            statistic_id,
+            start,
+            when,
         )
 
     async def _fetch_rates(self, today: date) -> list[TariffRate]:

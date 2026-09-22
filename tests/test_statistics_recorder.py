@@ -8,7 +8,9 @@ rows with continuous sums, not daily lumps.
 
 from __future__ import annotations
 
+import logging
 from datetime import date, datetime, timezone
+from unittest.mock import AsyncMock
 
 import pytest
 from enovapower import BillingPeriod
@@ -20,9 +22,16 @@ from pytest_homeassistant_custom_component.components.recorder.common import (
     async_wait_recording_done,
 )
 
-from custom_components.enova_power.const import PLAN_TIERED, PLAN_TOU
+from custom_components.enova_power.const import (
+    CONF_STATS_VERSION,
+    PLAN_TIERED,
+    PLAN_TOU,
+    TIME_ZONE,
+)
 from custom_components.enova_power.statistics import (
+    STATS_VERSION,
     async_import_meter,
+    async_scan_series,
     bucket_cost_statistic_id,
     bucket_statistic_id,
     consumption_statistic_id,
@@ -32,6 +41,7 @@ from custom_components.enova_power.statistics import (
     tiered_rates,
 )
 
+from .test_coordinator import _coordinator
 from .test_statistics import TIER_RATES, TOU_RATES, _reading
 
 METER = "111"
@@ -218,3 +228,114 @@ async def test_DW_1_2_omitted_tier2_hour_becomes_zero_increment(
     await _assert_no_drops(
         hass, expected_statistic_ids(METER, PLAN_TIERED, TIER_RATES, tiered)
     )
+
+
+# --- integrity check + heal ----------------------------------------------------- #
+
+JUL1, JUL2, JUL10, JUL15 = (date(2026, 7, d) for d in (1, 2, 10, 15))
+JUL10_MIDNIGHT = datetime(2026, 7, 10, 4, tzinfo=timezone.utc)  # 00:00 EDT
+TOU_IDS = expected_statistic_ids(METER, PLAN_TOU, TOU_RATES, None)
+# 30 kWh/h crosses the 600 kWh tier threshold on day one, so tier2 has rows
+# like a real meter's (an empty expected series would trigger the
+# missing-series full refetch instead of exercising the heal).
+KWH = 30.0
+
+
+def _chain(hours: int, base: float = 0.0) -> list[float]:
+    return [base + KWH * i for i in range(1, hours + 1)]
+
+
+async def _plant_july_pattern(hass: HomeAssistant) -> None:
+    """Reproduce the July incident: Jul 1–2 stored as one chain, Jul 10
+    imported on a zero base (its sum restarts), Jul 15 appended after it.
+    Every series with a Jul 10 row has its sum fall there."""
+    await _import(hass, [_full_day(JUL1, KWH), _full_day(JUL2, KWH)], JUL1, JUL2)
+    await _import(hass, [_full_day(JUL10, KWH)], JUL10, JUL10, rebuild=True)
+    await _import(hass, [_full_day(JUL15, KWH)], JUL15, JUL15)
+    rows = await _hourly_rows(hass, consumption_statistic_id(METER))
+    assert [r["sum"] for r in rows] == _chain(48) + _chain(48)
+
+
+async def test_DW_2_2_planted_july_pattern_reported_broken(
+    recorder_mock, hass: HomeAssistant
+) -> None:
+    await _plant_july_pattern(hass)
+
+    readings = [_full_day(d, KWH) for d in (JUL1, JUL2, JUL10, JUL15)]
+    result = await async_import_meter(
+        hass, METER, readings, PLAN_TOU, TOU_RATES, None, [], "CAD",
+        window=download_window(JUL1, JUL15), covered_days=days_covered(readings),
+    )
+    await async_wait_recording_done(hass)
+
+    # Every series with a Jul 10 row reports exactly one drop, at its first
+    # hour that day. ULO off-peak only has rows on weekends/holidays (Canada
+    # Day) — nothing on Jul 10, so nothing to fall.
+    assert set(result.broken) == set(TOU_IDS) - {bucket_statistic_id(METER, "ulo_off_peak")}
+    for drops in result.broken.values():
+        assert len(drops) == 1
+        assert drops[0].astimezone(TIME_ZONE).date() == JUL10
+    assert result.broken[consumption_statistic_id(METER)] == [JUL10_MIDNIGHT]
+    assert result.broken[bucket_statistic_id(METER, "tou_off_peak")] == [JUL10_MIDNIGHT]
+    assert result.broken[bucket_cost_statistic_id(METER, "tou_off_peak")] == [JUL10_MIDNIGHT]
+    assert result.broken[bucket_statistic_id(METER, "tou_on_peak")] == [
+        datetime(2026, 7, 10, 15, tzinfo=timezone.utc)  # 11:00 EDT, first on-peak hour
+    ]
+    # The rewrite over the window put the chain back together.
+    assert result.total == 96 * KWH
+    rows = await _hourly_rows(hass, consumption_statistic_id(METER))
+    assert [r["sum"] for r in rows] == _chain(96)
+    await _assert_no_drops(hass, TOU_IDS)
+
+
+async def test_scan_series_against_recorder(recorder_mock, hass: HomeAssistant) -> None:
+    await _plant_july_pattern(hass)
+    scans = await async_scan_series(hass, [*TOU_IDS, "enova_power:energy_never_111"])
+    consumption = scans[consumption_statistic_id(METER)]
+    assert consumption.first_start == datetime(2026, 7, 1, 4, tzinfo=timezone.utc)
+    assert consumption.drops == [JUL10_MIDNIGHT]
+    assert scans["enova_power:energy_never_111"].first_start is None
+    assert scans["enova_power:energy_never_111"].drops == []
+
+
+async def test_DW_2_4_startup_scan_heals_break_outside_window(
+    recorder_mock, hass: HomeAssistant, caplog: pytest.LogCaptureFixture
+) -> None:
+    await _plant_july_pattern(hass)
+    # A cycle closed Jul 12, so a normal window starts Jul 13 — after the break.
+    period = BillingPeriod(date(2026, 6, 30), date(2026, 7, 12), 12, 0.0, 0.0)
+    coord = _coordinator(hass, detected=PLAN_TOU, data={CONF_STATS_VERSION: STATS_VERSION})
+    coord.rates = TOU_RATES
+    coord.client.billing_periods = AsyncMock(return_value=[period])
+    published = {d: _full_day(d, KWH) for d in (JUL1, JUL2, JUL10, JUL15)}
+
+    async def download_usage(from_date: date, to_date: date, *, meter_id: str) -> list:
+        return [r for d, r in published.items() if from_date <= d <= to_date]
+
+    coord.client.download_usage = AsyncMock(side_effect=download_usage)
+    today = date(2026, 7, 20)
+
+    # First refresh: the scan finds the break, caches the oldest date, and the
+    # same cycle re-imports everything from it.
+    await coord._update_meter(METER, today, None)
+    await async_wait_recording_done(hass)
+
+    assert coord._oldest == {METER: JUL1}
+    assert coord.client.download_usage.call_args.args[:2] == (JUL1, today)
+    assert "re-importing its full history now" in caplog.text
+    assert coord._last_heal == {METER: today}
+    assert coord._heal_pending == set()
+    assert (consumption_statistic_id(METER), JUL10_MIDNIGHT) in coord._pre_heal[METER]
+    rows = await _hourly_rows(hass, consumption_statistic_id(METER))
+    assert [r["sum"] for r in rows] == _chain(96)
+    await _assert_no_drops(hass, TOU_IDS)
+
+    # The next cycle is back on the normal window (Jul 13 →, overlapping the
+    # stored Jul 15 rows so the check runs), finds the chain clean: no error.
+    await coord._update_meter(METER, today, None)
+    await async_wait_recording_done(hass)
+    assert coord.client.download_usage.call_args.args[:2] == (date(2026, 7, 13), today)
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert coord._pre_heal == {}
+    assert coord._unhealable == set()
+    assert coord._heal_pending == set()

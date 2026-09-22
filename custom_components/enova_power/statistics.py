@@ -43,6 +43,13 @@ then gets revised to real hourly values a day later. History older than the
 window is never touched; a series added by an upgrade still can't backfill on
 its own — ``expected_statistic_ids`` + ``async_missing_series`` let the
 coordinator detect that case and refetch full history once.
+
+The same pre-write read doubles as an **integrity check**: a cumulative sum
+must never fall, so ``find_sum_drops`` over the anchor plus the stored rows
+reports every hour whose sum is below its predecessor's. ``async_import_meter``
+returns those per series (``ImportResult.broken``) and ``async_scan_series``
+runs the check over a series' full history once at startup; the coordinator
+heals a broken meter by re-importing it from its oldest stored date.
 """
 
 from __future__ import annotations
@@ -51,6 +58,7 @@ from collections import defaultdict
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
+from itertools import pairwise
 
 from enovapower import BillingPeriod, TariffRate, UsageReading
 
@@ -397,6 +405,14 @@ def _normalize_start(value: object) -> datetime | None:
     return None
 
 
+def _row_point(row: dict | None) -> tuple[datetime, float] | None:
+    """A recorder row as a ``(start_utc, sum)`` point; None if either is unusable."""
+    if not row or row.get("sum") is None:
+        return None
+    start = _normalize_start(row.get("start"))
+    return (start, float(row["sum"])) if start is not None else None
+
+
 def _flatten_points(readings: Iterable[UsageReading]) -> list[tuple[datetime, float]]:
     """Flatten readings to sorted ``(interval_start, kWh)``, dropping missing hours."""
     return sorted(
@@ -519,10 +535,13 @@ async def _async_last_row(hass: HomeAssistant, statistic_id: str) -> dict | None
 # a full-history scan (only relevant for series with months-long gaps).
 _ANCHOR_LOOKBACK = timedelta(days=90)
 
+# Start of a full-history read.
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
 
 def _row_before(hass: HomeAssistant, statistic_id: str, before: datetime) -> dict | None:
     """The last stored row strictly before ``before`` (recorder executor)."""
-    for start in (before - _ANCHOR_LOOKBACK, datetime(1970, 1, 1, tzinfo=timezone.utc)):
+    for start in (before - _ANCHOR_LOOKBACK, _EPOCH):
         rows = statistics_during_period(
             hass, start, before, {statistic_id}, "hour", None, {"sum"}
         ).get(statistic_id)
@@ -546,6 +565,72 @@ async def async_last_statistic_start(
     """Return the start of the most recent stored statistic, or None if empty."""
     row = await _async_last_row(hass, statistic_id)
     return _normalize_start(row.get("start")) if row else None
+
+
+# --------------------------------------------------------------------------- #
+# Integrity check (cumulative sums must never fall)
+# --------------------------------------------------------------------------- #
+
+
+def find_sum_drops(
+    rows: list[tuple[datetime, float]], tolerance: float = 1e-6
+) -> list[datetime]:
+    """Start times of the rows whose sum falls below the previous row's.
+
+    ``rows`` are ascending ``(start, sum)``; callers checking a window pass the
+    anchor row first so a break at the first stored row is caught too. A fall
+    of at most ``tolerance`` is float noise, not a drop.
+    """
+    return [
+        start
+        for (_, previous_sum), (start, current_sum) in pairwise(rows)
+        if current_sum < previous_sum - tolerance
+    ]
+
+
+@dataclass(frozen=True)
+class SeriesScan:
+    """A series' full-history check: its first stored hour and its sum drops."""
+
+    first_start: datetime | None  # None → the series has no rows
+    drops: list[datetime]
+
+
+def _scan_series(hass: HomeAssistant, ids: list[str]) -> dict[str, SeriesScan]:
+    """Check every series in ``ids`` over its full history (recorder executor).
+
+    One batched read for the whole meter; every requested id gets an entry,
+    so a series with no rows scans clean with ``first_start`` None.
+    """
+    stored = _stored_rows(hass, set(ids), _EPOCH)
+    scans: dict[str, SeriesScan] = {}
+    for statistic_id in ids:
+        rows = stored.get(statistic_id, [])
+        first_start = rows[0][0] if rows else None
+        scans[statistic_id] = SeriesScan(first_start, find_sum_drops(rows))
+    return scans
+
+
+async def async_scan_series(hass: HomeAssistant, ids: list[str]) -> dict[str, SeriesScan]:
+    """Async wrapper for :func:`_scan_series`."""
+    return await get_instance(hass).async_add_executor_job(_scan_series, hass, ids)
+
+
+@dataclass(frozen=True)
+class SeriesResult:
+    """One series' import: its cumulative sum after the write and the drops
+    its pre-write read found (empty when nothing overlapping was read)."""
+
+    total: float | None
+    drops: list[datetime]
+
+
+@dataclass(frozen=True)
+class ImportResult:
+    """A meter's import: consumption total and the broken series' drop times."""
+
+    total: float | None
+    broken: dict[str, list[datetime]]
 
 
 def _priced(plan: str, rates: list[TariffRate], tiered: TieredRates | None) -> bool:
@@ -658,19 +743,21 @@ async def _async_import_series(
     covered_days: set[date],
     fresh: bool = False,
     stored: list[tuple[datetime, float]] | None = None,
-) -> float | None:
+) -> SeriesResult:
     """Import one cumulative-sum statistic series over the download ``window``.
 
     Returns the series' cumulative sum after the import — the value its last
     row will carry once the recorder flushes (computed here rather than read
     back, since recorder writes are queued) — or None if the series has never
-    stored a point.
+    stored a point — together with the sum drops the pre-write read found
+    (anchor row + stored rows; see ``find_sum_drops``).
 
     When stored rows exist from ``window_start`` on, the import anchors on the
     last stored row *before* the window and rewrites one continuous chain over
     the stored rows and the new points (see ``_merge_statistics``); otherwise
-    it appends after the newest stored row with no further read. ``stored``
-    carries the meter-wide batched read (None → read this series now).
+    it appends after the newest stored row with no further read — and no
+    check, since nothing overlapping was read. ``stored`` carries the
+    meter-wide batched read (None → read this series now).
 
     With ``fresh=True`` any stored rows are ignored (sum restarts at zero,
     nothing is filtered): used by the format rebuild, whose queued clear may
@@ -686,6 +773,7 @@ async def _async_import_series(
         )
 
     row = None
+    drops: list[datetime] = []
     if fresh:
         stored, base_sum = [], 0.0
     else:
@@ -694,8 +782,11 @@ async def _async_import_series(
                 statistic_id, []
             )
         if stored:
-            # Stored rows overlap the window: rewrite the chain from the anchor.
+            # Stored rows overlap the window: rewrite the chain from the anchor,
+            # and check the chain the read saw (anchor first).
             row = await _async_row_before(hass, statistic_id, window_start)
+            anchor = _row_point(row)
+            drops = find_sum_drops(([anchor] if anchor else []) + stored)
         else:
             # Pure append: the newest stored row is the anchor.
             row = await _async_last_row(hass, statistic_id)
@@ -708,8 +799,8 @@ async def _async_import_series(
     if not stats:
         # Chain unchanged: the series still ends on its last stored sum.
         if stored:
-            return stored[-1][1]
-        return base_sum if row else None
+            return SeriesResult(stored[-1][1], drops)
+        return SeriesResult(base_sum if row else None, drops)
 
     # unit_class must be stated explicitly (required from HA 2026.11):
     # "energy" for kWh; None for units with no converter (currency).
@@ -725,7 +816,7 @@ async def _async_import_series(
     )
     LOGGER.debug("Adding %d statistics points to %s", len(stats), statistic_id)
     async_add_external_statistics(hass, metadata, stats)
-    return stats[-1]["sum"]
+    return SeriesResult(stats[-1]["sum"], drops)
 
 
 async def async_import_meter(
@@ -741,7 +832,7 @@ async def async_import_meter(
     window: Window,
     covered_days: set[date],
     rebuild: bool = False,
-) -> float | None:
+) -> ImportResult:
     """Import a meter's consumption, all buckets, active cost, and cost_if_* series.
 
     ``window`` and ``covered_days`` describe the download ``readings`` came
@@ -754,7 +845,8 @@ async def async_import_meter(
     included (see ``async_start_rebuild`` and ``rebuild_statistic_ids``).
 
     Returns the consumption series' cumulative sum — the meter's lifetime kWh
-    since the first backfill (None until anything has been stored).
+    since the first backfill (None until anything has been stored) — and, per
+    series whose stored chain had sum drops before this write, the drop times.
     """
     kwh = UnitOfEnergy.KILO_WATT_HOUR
     series: list[tuple[str, str, list[tuple[datetime, float]], str]] = [
@@ -813,7 +905,7 @@ async def async_import_meter(
         if rebuild
         else await _async_stored_rows(hass, {sid for sid, *_ in series}, window[0])
     )
-    totals = [
+    results = [
         await _async_import_series(
             hass,
             statistic_id,
@@ -827,4 +919,9 @@ async def async_import_meter(
         )
         for statistic_id, name, points, unit in series
     ]
-    return totals[0]
+    broken = {
+        statistic_id: result.drops
+        for (statistic_id, *_), result in zip(series, results, strict=True)
+        if result.drops
+    }
+    return ImportResult(results[0].total, broken)

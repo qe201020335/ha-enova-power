@@ -1,14 +1,16 @@
-"""Tests for the coordinator's download-window selection (pure logic)."""
+"""Tests for the coordinator's download-window selection and heal state machine."""
 
 from __future__ import annotations
 
+import logging
 from datetime import date, datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from enovapower import BillingPeriod
+from enovapower import BillingPeriod, EnovaError
 
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.update_coordinator import UpdateFailed
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.enova_power.const import (
@@ -26,7 +28,13 @@ from custom_components.enova_power.coordinator import (
     cycle_start_containing,
     fetch_from_date,
 )
-from custom_components.enova_power.statistics import STATS_VERSION, download_window
+from custom_components.enova_power.statistics import (
+    STATS_VERSION,
+    ImportResult,
+    SeriesScan,
+    consumption_statistic_id,
+    download_window,
+)
 
 from .test_statistics import _reading
 
@@ -126,9 +134,10 @@ async def test_DW_1_5_update_meter_downloads_whole_cycles_and_reaches_back_once(
     client.billing_periods = AsyncMock(return_value=[P1])
     client.download_usage = AsyncMock(return_value=[])
     last_start = AsyncMock()
-    import_meter = AsyncMock(return_value=None)
+    import_meter = AsyncMock(return_value=ImportResult(None, {}))
     monkeypatch.setattr(coordinator_module, "async_last_statistic_start", last_start)
     monkeypatch.setattr(coordinator_module, "async_missing_series", AsyncMock(return_value=[]))
+    monkeypatch.setattr(coordinator_module, "async_scan_series", AsyncMock(return_value={}))
     monkeypatch.setattr(coordinator_module, "async_import_meter", import_meter)
 
     async def cycle(today: date, periods: list[BillingPeriod]) -> tuple[date, date]:
@@ -158,3 +167,228 @@ async def test_DW_1_5_update_meter_downloads_whole_cycles_and_reaches_back_once(
     assert kwargs["window"] == download_window(date(2026, 7, 21), date(2026, 7, 27))
     assert kwargs["covered_days"] == {date(2026, 7, 26)}
     assert kwargs["rebuild"] is False
+
+
+# --- integrity check + heal state machine ------------------------------------- #
+
+METER = "111"
+CONS = consumption_statistic_id(METER)
+# Oldest stored hour: local midnight Jul 1 2025 (EDT) — a month start, so the
+# billing-cycle snap leaves a heal's from-date exactly there.
+FIRST_START = datetime(2025, 7, 1, 4, tzinfo=timezone.utc)
+OLDEST = date(2025, 7, 1)
+TODAY = date(2026, 7, 15)
+NORMAL_FROM = date(2026, 7, 1)  # no billing periods → the calendar month
+T1 = datetime(2026, 7, 10, 4, tzinfo=timezone.utc)
+T2 = datetime(2026, 7, 11, 4, tzinfo=timezone.utc)
+
+
+def _healing_coordinator(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    scan: dict[str, SeriesScan] | None = None,
+    stats_version: int = STATS_VERSION,
+) -> tuple[EnovaPowerCoordinator, AsyncMock, AsyncMock]:
+    """A coordinator with every recorder seam stubbed; statistics are stored
+    through yesterday and the startup scan returns ``scan`` (clean by default).
+    Returns it with the ``async_import_meter`` and ``async_scan_series`` mocks."""
+    coord = _coordinator(hass, detected=PLAN_TOU, data={CONF_STATS_VERSION: stats_version})
+    coord.client.meter_ids = [METER]
+    coord.client.billing_periods = AsyncMock(return_value=[])
+    coord.client.download_usage = AsyncMock(return_value=[])
+    coord.client.download_tariff = AsyncMock(return_value=[])
+    yesterday = datetime(2026, 7, 14, 4, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        coordinator_module, "async_last_statistic_start", AsyncMock(return_value=yesterday)
+    )
+    monkeypatch.setattr(coordinator_module, "async_missing_series", AsyncMock(return_value=[]))
+    if scan is None:
+        scan = {CONS: SeriesScan(FIRST_START, [])}
+    scan_series = AsyncMock(return_value=scan)
+    monkeypatch.setattr(coordinator_module, "async_scan_series", scan_series)
+    import_meter = AsyncMock(return_value=ImportResult(None, {}))
+    monkeypatch.setattr(coordinator_module, "async_import_meter", import_meter)
+    return coord, import_meter, scan_series
+
+
+async def _cycle(
+    coord: EnovaPowerCoordinator,
+    import_meter: AsyncMock,
+    today: date,
+    broken: dict[str, list[datetime]],
+) -> date:
+    """Run one update cycle whose import reports ``broken``; return the download start."""
+    import_meter.return_value = ImportResult(None, broken)
+    await coord._update_meter(METER, today, None)
+    return coord.client.download_usage.call_args.args[0]
+
+
+def _errors(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+
+
+async def test_DW_2_3_reported_drop_heals_next_cycle_from_oldest_date(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    coord, import_meter, _ = _healing_coordinator(hass, monkeypatch)
+
+    # Cycle 1: the startup scan is clean, but the import's own check reports a
+    # drop → warning, heal queued for the next cycle.
+    assert await _cycle(coord, import_meter, TODAY, {CONS: [T1]}) == NORMAL_FROM
+    assert coord._oldest == {METER: OLDEST}
+    assert coord._heal_pending == {METER}
+    assert (
+        f"Meter {METER}: 1 statistics sum drop(s) detected (first: {CONS} at "
+        "2026-07-10 04:00:00+00:00); re-importing its full history on the next update"
+    ) in caplog.text
+
+    # Cycle 2: the heal — full history from the oldest stored date. Its own
+    # check still sees the pre-heal data: no error, nothing re-queued.
+    assert await _cycle(coord, import_meter, TODAY, {CONS: [T1]}) == OLDEST
+    assert _errors(caplog) == []
+    assert coord._heal_pending == set()
+    assert coord._last_heal == {METER: TODAY}
+    assert coord._pre_heal == {METER: {(CONS, T1)}}
+
+    # Cycle 3: healed — a clean report on the normal window, nothing remembered.
+    assert await _cycle(coord, import_meter, TODAY, {}) == NORMAL_FROM
+    assert _errors(caplog) == []
+    assert coord._pre_heal == {}
+    assert coord._unhealable == set()
+
+
+async def test_DW_2_3_persistent_drop_errors_once_and_is_never_rehealed(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    coord, import_meter, _ = _healing_coordinator(hass, monkeypatch)
+    await _cycle(coord, import_meter, TODAY, {CONS: [T1]})  # detect
+    assert await _cycle(coord, import_meter, TODAY, {CONS: [T1]}) == OLDEST  # heal
+
+    # Still there after the heal → one ERROR naming the series and hour.
+    assert await _cycle(coord, import_meter, TODAY, {CONS: [T1]}) == NORMAL_FROM
+    assert _errors(caplog) == [
+        f"{CONS} still has a sum drop at 2026-07-10 04:00:00+00:00 after a full "
+        "re-import from the portal; it will not be re-imported for this again until restart"
+    ]
+    assert coord._unhealable == {(CONS, T1)}
+    assert coord._heal_pending == set()
+
+    # Reported again today and tomorrow: no new error, no heal.
+    for day in (TODAY, TODAY + timedelta(days=1)):
+        assert await _cycle(coord, import_meter, day, {CONS: [T1]}) == NORMAL_FROM
+    assert len(_errors(caplog)) == 1
+    assert coord._heal_pending == set()
+    assert coord._last_heal == {METER: TODAY}
+
+
+async def test_DW_2_3_new_drop_same_day_defers_to_tomorrow(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    coord, import_meter, _ = _healing_coordinator(hass, monkeypatch)
+    await _cycle(coord, import_meter, TODAY, {CONS: [T1]})  # detect
+    assert await _cycle(coord, import_meter, TODAY, {CONS: [T1]}) == OLDEST  # heal
+
+    # A different drop the same day: queued for tomorrow, no error.
+    assert await _cycle(coord, import_meter, TODAY, {CONS: [T2]}) == NORMAL_FROM
+    assert _errors(caplog) == []
+    assert coord._heal_pending == {METER}
+    assert "re-importing its full history tomorrow (already re-imported once today)" in caplog.text
+
+    # Later cycles today stay on the normal window and don't warn again.
+    warnings = len([r for r in caplog.records if r.levelno == logging.WARNING])
+    assert await _cycle(coord, import_meter, TODAY, {CONS: [T2]}) == NORMAL_FROM
+    assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == warnings
+
+    # Tomorrow's first cycle heals.
+    tomorrow = TODAY + timedelta(days=1)
+    assert await _cycle(coord, import_meter, tomorrow, {CONS: [T2]}) == OLDEST
+    assert coord._last_heal == {METER: tomorrow}
+    assert coord._heal_pending == set()
+    assert _errors(caplog) == []
+
+
+async def test_startup_scan_heals_in_the_first_refresh_and_runs_once(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    scan = {CONS: SeriesScan(FIRST_START, [T1]), "enova_power:energy_tier2_111": SeriesScan(None, [])}
+    coord, import_meter, scan_series = _healing_coordinator(hass, monkeypatch, scan=scan)
+
+    # First refresh: the scan's drop is healed right away, from the oldest date.
+    assert await _cycle(coord, import_meter, TODAY, {CONS: [T1]}) == OLDEST
+    assert "re-importing its full history now" in caplog.text
+    assert coord._oldest == {METER: OLDEST}
+    assert coord._last_heal == {METER: TODAY}
+    assert coord._pre_heal == {METER: {(CONS, T1)}}
+
+    # The next cycle is normal and does not scan again.
+    assert await _cycle(coord, import_meter, TODAY, {}) == NORMAL_FROM
+    assert scan_series.await_count == 1
+    assert _errors(caplog) == []
+
+
+async def test_heal_stays_pending_when_the_download_fails(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    coord, import_meter, _ = _healing_coordinator(hass, monkeypatch)
+    await _cycle(coord, import_meter, TODAY, {CONS: [T1]})
+
+    coord.client.download_usage.side_effect = EnovaError("portal down")
+    with pytest.raises(UpdateFailed):
+        await coord._async_update_data()
+    assert coord._heal_pending == {METER}
+    assert coord._last_heal == {}
+
+    # The retry heals.
+    coord.client.download_usage.side_effect = None
+    assert await _cycle(coord, import_meter, TODAY, {CONS: [T1]}) == OLDEST
+
+
+async def test_heal_without_oldest_date_uses_backfill_window(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The scan found no rows for any series → the oldest date is unknown.
+    coord, import_meter, _ = _healing_coordinator(hass, monkeypatch, scan={CONS: SeriesScan(None, [])})
+    await _cycle(coord, import_meter, TODAY, {CONS: [T1]})
+    assert coord._oldest == {}
+    assert await coord._full_reimport_from(METER) is None
+
+    backfill = cycle_start_containing([], fetch_from_date(None, TODAY))
+    assert backfill == date(2025, 7, 1)
+    assert await _cycle(coord, import_meter, TODAY, {CONS: [T1]}) == backfill
+
+
+async def test_heal_window_never_shrinks_the_normal_window(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An oldest stored date *later* than this cycle's normal start (a series
+    # trimmed by the recorder's purge, say) must not pull the window forward.
+    scan = {CONS: SeriesScan(datetime(2026, 7, 5, 4, tzinfo=timezone.utc), [])}
+    coord, import_meter, _ = _healing_coordinator(hass, monkeypatch, scan=scan)
+    await _cycle(coord, import_meter, TODAY, {CONS: [T1]})
+    assert await _cycle(coord, import_meter, TODAY, {CONS: [T1]}) == NORMAL_FROM
+
+
+async def test_missing_series_refetches_full_history(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A series added by an upgrade has no rows → one full backfill, no heal.
+    coord, import_meter, _ = _healing_coordinator(hass, monkeypatch)
+    monkeypatch.setattr(
+        coordinator_module, "async_missing_series", AsyncMock(return_value=["enova_power:new"])
+    )
+    assert await _cycle(coord, import_meter, TODAY, {}) == date(2025, 7, 1)
+    assert f"Meter {METER} gained 1 statistics series; refetching full history" in caplog.text
+    assert coord._heal_pending == set()
+    assert import_meter.call_args.kwargs["rebuild"] is False
+
+
+async def test_rebuild_cycle_skips_the_startup_scan(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The queued clear may not have run yet, so stored rows can't be checked.
+    coord, import_meter, scan_series = _healing_coordinator(hass, monkeypatch, stats_version=1)
+    from_date = await _cycle(coord, import_meter, TODAY, {})
+    scan_series.assert_not_awaited()
+    assert from_date == cycle_start_containing([], fetch_from_date(None, TODAY))
+    assert import_meter.call_args.kwargs["rebuild"] is True
