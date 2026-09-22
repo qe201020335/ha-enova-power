@@ -15,13 +15,14 @@ from custom_components.enova_power.const import (
     PLAN_TIERED,
     PLAN_TOU,
     PLAN_ULO,
+    TIME_ZONE,
 )
 import custom_components.enova_power.statistics as statistics_module
 from custom_components.enova_power.statistics import (
     TieredRates,
     _async_import_series,
-    _build_statistics,
     _cycle_key,
+    _merge_statistics,
     _missing_series,
     _period_hourly,
     _tier_hourly,
@@ -34,6 +35,8 @@ from custom_components.enova_power.statistics import (
     cost_points,
     cost_statistic_id,
     cost_total,
+    days_covered,
+    download_window,
     expected_statistic_ids,
     plan_prices,
     rebuild_statistic_ids,
@@ -67,6 +70,20 @@ TIER_RATES = [
     TariffRate(date(2026, 5, 1), date(2026, 10, 31), "Tiered", "Tier 1", 10.0),
     TariffRate(date(2026, 5, 1), date(2026, 10, 31), "Tiered", "Tier 2", 20.0),
 ]
+
+# Unit-test download window: local Jan 1 2026 = 05:00 UTC through 04:00 UTC
+# on Jan 2 (EST). Rows at 04:00 UTC Jan 1 are before it; 05:00 UTC Jan 2 after.
+JAN1 = date(2026, 1, 1)
+WINDOW = download_window(JAN1, JAN1)
+
+
+def _utc(hour: int, day: int = 1) -> datetime:
+    return datetime(2026, 1, day, hour, tzinfo=timezone.utc)
+
+
+def _covered(*days: date):
+    """A ``covered`` predicate for the merge: local date of the hour in ``days``."""
+    return lambda start: start.astimezone(TIME_ZONE).date() in days
 
 
 # --- IDs -------------------------------------------------------------------- #
@@ -335,7 +352,8 @@ async def test_import_series_fresh_ignores_stored_rows(
     points = [(base, 1.0), (base.replace(hour=6), 2.0)]
 
     total = await _async_import_series(
-        None, "enova_power:x", "x", points, "kWh", fresh=True
+        None, "enova_power:x", "x", points, "kWh",
+        window=WINDOW, covered_days={JAN1}, fresh=True,
     )
 
     assert total == 3.0
@@ -362,42 +380,172 @@ async def test_import_meter_rebuild_reimports_everything(
 
     readings = [_reading(date(2026, 6, 1), h01=10.0, h13=5.0)]
     total = await statistics_module.async_import_meter(
-        None, "111", readings, PLAN_TOU, TOU_RATES, None, [], "CAD", rebuild=True
+        None, "111", readings, PLAN_TOU, TOU_RATES, None, [], "CAD",
+        window=download_window(date(2026, 6, 1), date(2026, 6, 1)),
+        covered_days=days_covered(readings),
+        rebuild=True,
     )
 
     # Every series — consumption included (its timestamps moved in v3) —
-    # ignores the stale row: full points, sums restarting from zero.
+    # ignores the stale row (no stored-rows read either): full points, sums
+    # restarting from zero.
     assert total == 15.0
     assert written[consumption_statistic_id("111")] == [10.0, 15.0]
     assert written[bucket_statistic_id("111", "tou_off_peak")] == [10.0]
     assert written[bucket_cost_statistic_id("111", "tou_on_peak")] == pytest.approx([1.015])
 
 
-# --- forward-only sum ------------------------------------------------------- #
+# --- window + covered days ----------------------------------------------------- #
 
 
-async def test_build_statistics_cumulative_sum() -> None:
-    base = datetime(2026, 1, 1, 5, tzinfo=timezone.utc)
-    points = [(base, 1.0), (base.replace(hour=6), 2.0)]
-    stats = _build_statistics(points, last_start=None, base_sum=0.0)
-    assert [s["sum"] for s in stats] == [1.0, 3.0]
+async def test_download_window_is_local_midnight_to_last_hour() -> None:
+    # Jan (EST, UTC-5): 00:00 local Jan 1 → 05:00 UTC; 23:00 local Jan 2 → 04:00 UTC Jan 3.
+    assert download_window(date(2026, 1, 1), date(2026, 1, 2)) == (
+        datetime(2026, 1, 1, 5, tzinfo=timezone.utc),
+        datetime(2026, 1, 3, 4, tzinfo=timezone.utc),
+    )
+    # July (EDT, UTC-4).
+    assert download_window(date(2026, 7, 1), date(2026, 7, 1)) == (
+        datetime(2026, 7, 1, 4, tzinfo=timezone.utc),
+        datetime(2026, 7, 2, 3, tzinfo=timezone.utc),
+    )
 
 
-async def test_build_statistics_resumes_and_dedups() -> None:
-    base = datetime(2026, 1, 1, 5, tzinfo=timezone.utc)
-    points = [(base, 1.0), (base.replace(hour=6), 2.0), (base.replace(hour=7), 3.0)]
-    stats = _build_statistics(points, last_start=base.replace(hour=6), base_sum=10.0)
-    assert len(stats) == 1
-    assert stats[0]["sum"] == 13.0
+async def test_days_covered_needs_a_published_hour() -> None:
+    readings = [
+        _reading(date(2026, 6, 1), h13=0.0),  # a real zero counts as published
+        _reading(date(2026, 6, 2)),  # all None → the portal published nothing
+    ]
+    assert days_covered(readings) == {date(2026, 6, 1)}
+
+
+async def test_stored_rows_normalizes_and_skips_unusable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asked: list = []
+
+    def fake_during_period(hass, start, end, ids, period, units, types):
+        asked.append((start, end, ids, period, types))
+        return {
+            "enova_power:a": [
+                {"start": _utc(6).timestamp(), "sum": 2.0},  # float seconds (recorder)
+                {"start": _utc(5), "sum": 1.0},  # aware datetime
+                {"start": _utc(7).replace(tzinfo=None), "sum": 3.0},  # naive → UTC
+                {"start": None, "sum": 9.0},  # no start → skipped
+                {"start": _utc(8).timestamp(), "sum": None},  # no sum → skipped
+            ],
+        }
+
+    monkeypatch.setattr(statistics_module, "statistics_during_period", fake_during_period)
+    rows = statistics_module._stored_rows(None, {"enova_power:a", "enova_power:b"}, _utc(5))
+    # Ascending, UTC-aware, unusable rows dropped; ids with no rows are absent.
+    assert rows == {"enova_power:a": [(_utc(5), 1.0), (_utc(6), 2.0), (_utc(7), 3.0)]}
+    assert asked == [(_utc(5), None, {"enova_power:a", "enova_power:b"}, "hour", {"sum"})]
+
+
+# --- merge (pure) -------------------------------------------------------------- #
+
+
+async def test_DW_1_3_merge_zeroes_omitted_hour_on_covered_day() -> None:
+    # Stored 06:00 is in the window on a covered day but the new points skip
+    # it → zero increment; the other stored hours are replaced by the points.
+    stored = [(_utc(5), 10.0), (_utc(6), 20.0), (_utc(7), 30.0)]
+    points = [(_utc(5), 1.0), (_utc(7), 1.0)]
+    stats = _merge_statistics(points, 0.0, stored, WINDOW, _covered(JAN1))
+    assert [(s["start"], s["sum"]) for s in stats] == [
+        (_utc(5), 1.0), (_utc(6), 1.0), (_utc(7), 2.0),
+    ]
+
+
+async def test_DW_1_3_merge_preserves_uncovered_day() -> None:
+    # Two-day window; the download only covered Jan 1, so Jan 2's stored rows
+    # keep their stored increments (+5, +3) on the new base.
+    window = download_window(JAN1, date(2026, 1, 2))
+    stored = [(_utc(5), 10.0), (_utc(5, day=2), 15.0), (_utc(6, day=2), 18.0)]
+    stats = _merge_statistics([(_utc(5), 1.0)], 0.0, stored, window, _covered(JAN1))
+    assert [s["sum"] for s in stats] == [1.0, 6.0, 9.0]
+
+
+async def test_DW_1_3_merge_rebases_tail() -> None:
+    # Rows after the window keep their increments, shifted onto the new chain.
+    stored = [(_utc(5), 10.0), (_utc(5, day=2), 15.0), (_utc(6, day=2), 18.0)]
+    stats = _merge_statistics([(_utc(5), 4.0)], 100.0, stored, WINDOW, _covered(JAN1))
+    assert [s["sum"] for s in stats] == [104.0, 109.0, 112.0]
+
+
+async def test_DW_1_3_merge_anchor_none_bases_on_zero() -> None:
+    # No row before the window: the first stored increment is its whole sum.
+    window = download_window(JAN1, date(2026, 1, 2))
+    stored = [(_utc(5, day=2), 100.0), (_utc(6, day=2), 130.0)]
+    stats = _merge_statistics([(_utc(5), 2.0)], 0.0, stored, window, _covered(JAN1))
+    assert [s["sum"] for s in stats] == [2.0, 102.0, 132.0]
+
+
+async def test_DW_1_3_merge_sums_duplicate_timestamps() -> None:
+    points = [(_utc(5), 1.0), (_utc(5), 2.0), (_utc(6), 3.0)]
+    stats = _merge_statistics(points, 0.0, [(_utc(5), 50.0)], WINDOW, _covered(JAN1))
+    assert [(s["start"], s["sum"]) for s in stats] == [(_utc(5), 3.0), (_utc(6), 6.0)]
+
+
+async def test_DW_1_3_merge_without_stored_rows() -> None:
+    # Plain cumulative sum from the base (the pure-append path).
+    stats = _merge_statistics([(_utc(5), 1.0), (_utc(6), 2.0)], 10.0, [], WINDOW, _covered())
+    assert [s["sum"] for s in stats] == [11.0, 13.0]
+    assert stats[0]["state"] == 11.0
+
+
+async def test_DW_1_3_merge_no_points_zeroes_covered_rows() -> None:
+    # The download covered the day but this series has nothing there any more
+    # (a revised tier split) → every stored in-window hour becomes a zero row.
+    stored = [(_utc(5), 10.0), (_utc(6), 20.0)]
+    stats = _merge_statistics([], 5.0, stored, WINDOW, _covered(JAN1))
+    assert [s["sum"] for s in stats] == [5.0, 5.0]
+
+
+async def test_DW_1_3_merge_no_points_nothing_to_zero_is_noop() -> None:
+    # Nothing new and no covered day → the chain is unchanged; nothing to write.
+    stored = [(_utc(5), 10.0), (_utc(5, day=2), 15.0)]
+    assert _merge_statistics([], 0.0, stored, WINDOW, _covered()) == []
+    assert _merge_statistics([], 0.0, [], WINDOW, _covered(JAN1)) == []
+
+
+async def test_merge_ignores_stored_rows_before_window() -> None:
+    # History before the window is never touched — even if handed in.
+    stored = [(_utc(4), 3.0), (_utc(5), 10.0)]
+    stats = _merge_statistics([], 3.0, stored, WINDOW, _covered(JAN1))
+    assert [(s["start"], s["sum"]) for s in stats] == [(_utc(5), 3.0)]
+
+
+async def test_merge_window_end_is_inclusive() -> None:
+    # 04:00 UTC Jan 2 is the window's last hour (covered → zeroed); 05:00 is
+    # the first tail hour (increment preserved).
+    stored = [(_utc(4, day=2), 10.0), (_utc(5, day=2), 12.0)]
+    stats = _merge_statistics([(_utc(5), 1.0)], 0.0, stored, WINDOW, _covered(JAN1))
+    assert [s["sum"] for s in stats] == [1.0, 1.0, 3.0]
+
+
+async def test_merge_preserves_a_stored_drop_faithfully() -> None:
+    # A negative stored increment (a broken chain) is carried as-is: Phase 1
+    # rewrites consistently, it does not silently repair (that's Phase 2).
+    stored = [(_utc(5, day=2), 10.0), (_utc(6, day=2), 4.0)]
+    stats = _merge_statistics([(_utc(5), 1.0)], 0.0, stored, WINDOW, _covered(JAN1))
+    assert [s["sum"] for s in stats] == [1.0, 11.0, 5.0]
 
 
 # --- import series return value (lifetime total) ----------------------------- #
 
 
 def _patch_import(
-    monkeypatch: pytest.MonkeyPatch, row: dict | None, anchor: dict | None = None
+    monkeypatch: pytest.MonkeyPatch,
+    row: dict | None,
+    anchor: dict | None = None,
+    stored: list[tuple[datetime, float]] | None = None,
 ) -> list:
-    """Stub the recorder read/write; return the list capturing written stats."""
+    """Stub the recorder read/write; return the list capturing written stats.
+
+    ``row`` is the newest stored row (pure-append path), ``anchor`` the row
+    before the window and ``stored`` the rows from the window on (overlap path).
+    """
     written: list = []
 
     async def fake_last_row(hass, statistic_id):
@@ -406,8 +554,12 @@ def _patch_import(
     async def fake_row_before(hass, statistic_id, before):
         return anchor
 
+    async def fake_stored_rows(hass, statistic_ids, start):
+        return {statistic_id: list(stored or []) for statistic_id in statistic_ids}
+
     monkeypatch.setattr(statistics_module, "_async_last_row", fake_last_row)
     monkeypatch.setattr(statistics_module, "_async_row_before", fake_row_before)
+    monkeypatch.setattr(statistics_module, "_async_stored_rows", fake_stored_rows)
     monkeypatch.setattr(
         statistics_module,
         "async_add_external_statistics",
@@ -416,13 +568,17 @@ def _patch_import(
     return written
 
 
+async def _import(points, **kwargs) -> float | None:
+    kwargs.setdefault("window", WINDOW)
+    kwargs.setdefault("covered_days", {JAN1})
+    return await _async_import_series(None, "enova_power:x", "x", points, "kWh", **kwargs)
+
+
 async def test_import_series_returns_cumulative_total(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     written = _patch_import(monkeypatch, None)
-    base = datetime(2026, 1, 1, 5, tzinfo=timezone.utc)
-    points = [(base, 1.0), (base.replace(hour=6), 2.0)]
-    total = await _async_import_series(None, "enova_power:x", "x", points, "kWh")
+    total = await _import([(_utc(5), 1.0), (_utc(6), 2.0)])
     assert total == 3.0
     assert [s["sum"] for s in written] == [1.0, 3.0]
 
@@ -430,22 +586,53 @@ async def test_import_series_returns_cumulative_total(
 async def test_import_series_resumes_from_stored_sum(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    base = datetime(2026, 1, 1, 5, tzinfo=timezone.utc)
-    _patch_import(monkeypatch, {"start": base, "sum": 10.0})
-    total = await _async_import_series(
-        None, "enova_power:x", "x", [(base.replace(hour=6), 2.0)], "kWh"
-    )
-    assert total == 12.0
+    # Newest stored row is before the window → pure append on its sum.
+    _patch_import(monkeypatch, {"start": _utc(4), "sum": 10.0})
+    assert await _import([(_utc(6), 2.0)]) == 12.0
+
+
+async def test_import_series_append_path_reads_no_anchor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_import(monkeypatch, {"start": _utc(4), "sum": 10.0})
+
+    async def unexpected(hass, statistic_id, before):
+        raise AssertionError("anchor read on the pure-append path")
+
+    monkeypatch.setattr(statistics_module, "_async_row_before", unexpected)
+    assert await _import([(_utc(6), 2.0)]) == 12.0
 
 
 async def test_import_series_total_survives_no_new_points(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # Nothing published at all this window → the stored sum, no writes.
-    base = datetime(2026, 1, 1, 5, tzinfo=timezone.utc)
-    written = _patch_import(monkeypatch, {"start": base, "sum": 10.0})
-    assert await _async_import_series(None, "enova_power:x", "x", [], "kWh") == 10.0
+    written = _patch_import(monkeypatch, {"start": _utc(4), "sum": 10.0})
+    assert await _import([], covered_days=set()) == 10.0
     assert written == []
+
+
+async def test_import_series_no_points_uncovered_stored_rows_untouched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Empty download with in-window rows on days it didn't cover: no write,
+    # and the total is the sum the series already ends on.
+    anchor = {"start": _utc(4), "sum": 10.0}
+    stored = [(_utc(5), 12.0), (_utc(6), 15.0)]
+    written = _patch_import(monkeypatch, None, anchor=anchor, stored=stored)
+    assert await _import([], covered_days=set()) == 15.0
+    assert written == []
+
+
+async def test_import_series_no_points_zeroes_covered_stored_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # tier2 after a revision that drops below the threshold: no points, but
+    # the day was covered → its stored rows become zero-increment rows.
+    anchor = {"start": _utc(4), "sum": 10.0}
+    written = _patch_import(monkeypatch, None, anchor=anchor, stored=[(_utc(5), 12.0)])
+    assert await _import([]) == 10.0
+    assert [(s["start"], s["sum"]) for s in written] == [(_utc(5), 10.0)]
 
 
 async def test_import_series_rewrites_overlapping_window(
@@ -454,13 +641,12 @@ async def test_import_series_rewrites_overlapping_window(
     # The portal revises already-imported hours (preliminary → real values).
     # An overlapping window must be rewritten from the anchor row before it,
     # not silently skipped.
-    base = datetime(2026, 1, 1, 5, tzinfo=timezone.utc)
-    newest = {"start": base.replace(hour=7), "sum": 500.0}  # stale preliminary sums
-    anchor = {"start": base.replace(hour=4), "sum": 100.0}  # last row before window
-    written = _patch_import(monkeypatch, newest, anchor=anchor)
+    anchor = {"start": _utc(4), "sum": 100.0}  # last row before window
+    stale = [(_utc(5), 200.0), (_utc(6), 300.0), (_utc(7), 500.0)]  # preliminary sums
+    written = _patch_import(monkeypatch, None, anchor=anchor, stored=stale)
 
-    points = [(base, 2.0), (base.replace(hour=6), 3.0), (base.replace(hour=7), 4.0)]
-    total = await _async_import_series(None, "enova_power:x", "x", points, "kWh")
+    points = [(_utc(5), 2.0), (_utc(6), 3.0), (_utc(7), 4.0)]
+    total = await _import(points)
 
     # Sums re-derived from the anchor, replacing the stale rows in place.
     assert [s["sum"] for s in written] == [102.0, 105.0, 109.0]
@@ -471,20 +657,42 @@ async def test_import_series_overlap_without_anchor_starts_from_zero(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # Overlap at the very beginning of a series (no row before the window).
-    base = datetime(2026, 1, 1, 5, tzinfo=timezone.utc)
-    written = _patch_import(monkeypatch, {"start": base, "sum": 24.0}, anchor=None)
-    total = await _async_import_series(
-        None, "enova_power:x", "x", [(base, 1.0), (base.replace(hour=6), 2.0)], "kWh"
-    )
+    written = _patch_import(monkeypatch, None, anchor=None, stored=[(_utc(5), 24.0)])
+    total = await _import([(_utc(5), 1.0), (_utc(6), 2.0)])
     assert [s["sum"] for s in written] == [1.0, 3.0]
     assert total == 3.0
+
+
+async def test_import_series_reads_stored_rows_itself_when_not_given(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asked: list[tuple[set[str], datetime]] = []
+    _patch_import(monkeypatch, None, stored=[])
+
+    async def fake_stored_rows(hass, statistic_ids, start):
+        asked.append((statistic_ids, start))
+        return {}
+
+    monkeypatch.setattr(statistics_module, "_async_stored_rows", fake_stored_rows)
+    await _import([(_utc(5), 1.0)])
+    assert asked == [({"enova_power:x"}, WINDOW[0])]
+
+
+async def test_import_series_drops_points_outside_window(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    written = _patch_import(monkeypatch, None)
+    total = await _import([(_utc(4), 9.0), (_utc(5), 1.0), (_utc(5, day=2), 9.0)])
+    assert [(s["start"], s["sum"]) for s in written] == [(_utc(5), 1.0)]
+    assert total == 1.0
+    assert "Dropping 2 points outside the download window" in caplog.text
 
 
 async def test_import_series_none_when_series_empty(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_import(monkeypatch, None)
-    assert await _async_import_series(None, "enova_power:x", "x", [], "kWh") is None
+    assert await _import([]) is None
 
 
 async def test_import_series_metadata_uses_mean_type(
@@ -495,19 +703,14 @@ async def test_import_series_metadata_uses_mean_type(
     from homeassistant.components.recorder.models import StatisticMeanType
 
     captured: dict = {}
-
-    async def fake_last_row(hass, statistic_id):
-        return None
-
-    monkeypatch.setattr(statistics_module, "_async_last_row", fake_last_row)
+    _patch_import(monkeypatch, None)
     monkeypatch.setattr(
         statistics_module,
         "async_add_external_statistics",
         lambda hass, metadata, stats: captured.update(metadata),
     )
 
-    base = datetime(2026, 1, 1, 5, tzinfo=timezone.utc)
-    await _async_import_series(None, "enova_power:x", "x", [(base, 1.0)], "kWh")
+    await _import([(_utc(5), 1.0)])
 
     assert captured["mean_type"] == StatisticMeanType.NONE
     assert "has_mean" not in captured
@@ -520,11 +723,7 @@ async def test_import_meter_writes_bucket_costs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     written: dict[str, str] = {}  # statistic_id → unit
-
-    async def fake_last_row(hass, statistic_id):
-        return None
-
-    monkeypatch.setattr(statistics_module, "_async_last_row", fake_last_row)
+    _patch_import(monkeypatch, None)
     monkeypatch.setattr(
         statistics_module,
         "async_add_external_statistics",
@@ -537,7 +736,9 @@ async def test_import_meter_writes_bucket_costs(
     tiered = tiered_rates(TIER_RATES)
     readings = [_reading(date(2026, 6, 1), h01=10.0, h13=5.0)]
     total = await statistics_module.async_import_meter(
-        None, "111", readings, PLAN_TOU, rates, tiered, [], "CAD"
+        None, "111", readings, PLAN_TOU, rates, tiered, [], "CAD",
+        window=download_window(date(2026, 6, 1), date(2026, 6, 1)),
+        covered_days=days_covered(readings),
     )
 
     assert total == 15.0
@@ -553,3 +754,70 @@ async def test_import_meter_writes_bucket_costs(
     # Everything written must be expected, or upgrade detection would never settle.
     expected = set(expected_statistic_ids("111", PLAN_TOU, rates, tiered))
     assert set(written) <= expected
+
+
+async def _imported_ids(monkeypatch: pytest.MonkeyPatch, plan, rates, tiered) -> set[str]:
+    """Run ``async_import_meter`` and return the statistic ids it imported."""
+    imported: set[str] = set()
+
+    async def fake_import_series(hass, statistic_id, name, points, unit, **kwargs):
+        imported.add(statistic_id)
+        return None
+
+    async def fake_stored_rows(hass, statistic_ids, start):
+        return {}
+
+    monkeypatch.setattr(statistics_module, "_async_import_series", fake_import_series)
+    monkeypatch.setattr(statistics_module, "_async_stored_rows", fake_stored_rows)
+    readings = [_reading(date(2026, 6, 1), h01=10.0, h13=5.0)]
+    await statistics_module.async_import_meter(
+        None, "111", readings, plan, rates, tiered, [], "CAD",
+        window=download_window(date(2026, 6, 1), date(2026, 6, 1)),
+        covered_days=days_covered(readings),
+    )
+    return imported
+
+
+async def test_DW_1_4_unpriced_cost_series_not_imported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # No rates at all: not a single cost series is touched — importing one
+    # with no points would zero its stored rows on the covered day.
+    imported = await _imported_ids(monkeypatch, PLAN_TOU, [], None)
+    assert imported == set(expected_statistic_ids("111", PLAN_TOU, [], None))
+    assert not any(":cost" in statistic_id for statistic_id in imported)
+
+    # TOU rates only, Tiered plan active: TOU cost series import; the unpriced
+    # active-plan cost, cost_if_ulo/tiered and ULO/tier bucket costs do not.
+    imported = await _imported_ids(monkeypatch, PLAN_TIERED, TOU_RATES, None)
+    assert cost_if_statistic_id("111", PLAN_TOU) in imported
+    assert bucket_cost_statistic_id("111", "tou_on_peak") in imported
+    assert cost_statistic_id("111") not in imported
+    assert cost_if_statistic_id("111", PLAN_ULO) not in imported
+    assert cost_if_statistic_id("111", PLAN_TIERED) not in imported
+    assert bucket_cost_statistic_id("111", "ulo_overnight") not in imported
+    assert bucket_cost_statistic_id("111", "tier2") not in imported
+    assert imported == set(expected_statistic_ids("111", PLAN_TIERED, TOU_RATES, None))
+
+
+async def test_import_meter_batches_one_stored_rows_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reads: list[tuple[set[str], datetime]] = []
+    written = _patch_import(monkeypatch, None)
+
+    async def fake_stored_rows(hass, statistic_ids, start):
+        reads.append((statistic_ids, start))
+        return {}
+
+    monkeypatch.setattr(statistics_module, "_async_stored_rows", fake_stored_rows)
+    readings = [_reading(date(2026, 6, 1), h01=10.0)]
+    window = download_window(date(2026, 6, 1), date(2026, 6, 1))
+    await statistics_module.async_import_meter(
+        None, "111", readings, PLAN_TOU, TOU_RATES, None, [], "CAD",
+        window=window, covered_days={date(2026, 6, 1)},
+    )
+    # One read for the whole meter, from the window start, covering every id.
+    assert len(reads) == 1
+    assert reads[0] == (set(expected_statistic_ids("111", PLAN_TOU, TOU_RATES, None)), window[0])
+    assert written

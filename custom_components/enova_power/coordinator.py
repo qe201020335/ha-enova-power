@@ -48,6 +48,8 @@ from .statistics import (
     async_missing_series,
     consumption_statistic_id,
     cost_total,
+    days_covered,
+    download_window,
     expected_statistic_ids,
     season_threshold,
     tiered_rates,
@@ -92,6 +94,27 @@ def current_cycle_start(periods: list[BillingPeriod], today: date) -> date:
     if periods:
         return max(p.end_date for p in periods) + timedelta(days=1)
     return today.replace(day=1)
+
+
+def cycle_start_containing(periods: list[BillingPeriod], d: date) -> date:
+    """First day of the tier-split group containing ``d`` (see ``_cycle_key``).
+
+    Inside a known billing cycle (``start_date < d <= end_date`` — ``start_date``
+    is the previous read date, exclusive) that's the cycle's first day. Days
+    outside every known cycle are split by calendar month, so reach back to the
+    first of ``d``'s month — but never into a closed cycle: a window that
+    starts partway through a cycle would re-split it from a zero cumulative and
+    rewrite its real tier rows. Downloading from here keeps the tier split
+    stable across imports.
+    """
+    for p in periods:
+        if p.start_date < d <= p.end_date:
+            return p.start_date + timedelta(days=1)
+    month_start = d.replace(day=1)
+    closed_before = [p.end_date for p in periods if p.end_date < d]
+    if closed_before and max(closed_before) >= month_start:
+        return max(closed_before) + timedelta(days=1)
+    return month_start
 
 
 class EnovaPowerCoordinator(DataUpdateCoordinator[dict[str, "MeterData"]]):
@@ -200,8 +223,12 @@ class EnovaPowerCoordinator(DataUpdateCoordinator[dict[str, "MeterData"]]):
                     )
                     last_start = None
         # Always cover the whole current cycle so cycle-to-date and tier
-        # accumulation are correct.
+        # accumulation are correct, then snap back to the start of the billing
+        # cycle the window begins in so the tier split is computed on whole
+        # cycles (when a bill posts, this reaches back over the newly closed
+        # cycle once, rewriting its month-keyed split as cycle-keyed).
         from_date = min(fetch_from_date(last_start, today), cycle_start)
+        from_date = cycle_start_containing(periods, from_date)
         if last_start is None:
             LOGGER.debug("No prior statistics for %s; backfilling from %s", meter_id, from_date)
 
@@ -215,6 +242,8 @@ class EnovaPowerCoordinator(DataUpdateCoordinator[dict[str, "MeterData"]]):
             tiered,
             periods,
             CURRENCY,
+            window=download_window(from_date, today),
+            covered_days=days_covered(readings),
             rebuild=self._rebuild,
         )
 

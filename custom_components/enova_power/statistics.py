@@ -25,18 +25,24 @@ Each kWh bucket also gets a paired **cost series** (``cost_<bucket>_<meter>``),
 priced at its scheme's current rates, so buckets can be tracked with costs in
 the Energy dashboard; a scheme's bucket costs sum to its ``cost_if_*`` series.
 
-External statistics carry an absolute cumulative ``sum``. When the downloaded
-window overlaps rows already stored, the import **anchors and rewrites**: it
-re-derives running sums from the last stored row *before* the window and
-re-imports the whole window, updating overlapping rows in place. This is
-idempotent when nothing changed, and it heals the portal's publication
-pattern — a day first appears as a preliminary row with the whole total in
-the first hour slot and explicit zeros elsewhere, then gets revised to real
-hourly values a day later. (A strictly forward-only import permanently locks
-in the preliminary shape.) History older than the downloaded window is never
-touched; a series added by an upgrade still can't backfill on its own —
-``expected_statistic_ids`` + ``async_missing_series`` let the coordinator
-detect that case and refetch full history once.
+External statistics carry an absolute cumulative ``sum``. Every series of a
+meter shares one **download window** — the coordinator's ``[from_date, today]``
+as UTC hour bounds — and the set of **covered days** (local dates the download
+returned with at least one published hour). When the window overlaps rows
+already stored, the import **anchors, merges and rewrites**: it anchors on the
+last stored row *before* the window, then re-derives one continuous chain over
+the stored rows from the window on and the new points (``_merge_statistics``):
+new points replace stored hours; a stored in-window hour on a covered day that
+the download no longer carries becomes a zero increment (so a revised tier
+split or a revised preliminary day can't leave stale plateaus behind); stored
+hours on uncovered days and rows after the window keep their stored increments,
+re-based on the new chain. This is idempotent when nothing changed, and it
+heals the portal's publication pattern — a day first appears as a preliminary
+row with the whole total in the first hour slot and explicit zeros elsewhere,
+then gets revised to real hourly values a day later. History older than the
+window is never touched; a series added by an upgrade still can't backfill on
+its own — ``expected_statistic_ids`` + ``async_missing_series`` let the
+coordinator detect that case and refetch full history once.
 """
 
 from __future__ import annotations
@@ -44,7 +50,7 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 
 from enovapower import BillingPeriod, TariffRate, UsageReading
 
@@ -73,6 +79,7 @@ from .const import (
     PLAN_TIERED,
     PLAN_TOU,
     PLAN_ULO,
+    TIME_ZONE,
 )
 from .schedule import period_for_interval
 
@@ -277,13 +284,17 @@ def bucket_points(
 def _period_cost_hourly(
     readings: list[UsageReading], plan: str, prices: dict[str, float]
 ) -> dict[str, list[tuple[datetime, float]]]:
-    """``{period: [(hour_start, dollars)]}`` for a TOU/ULO scheme (priced periods only)."""
-    result: dict[str, list[tuple[datetime, float]]] = {}
-    for period, points in _period_hourly(readings, plan).items():
-        rate = prices.get(period)
-        if rate is not None:
-            result[period] = [(start, kwh * rate / 100.0) for start, kwh in points]
-    return result
+    """``{period: [(hour_start, dollars)]}`` for a TOU/ULO scheme.
+
+    Every priced period is present — empty when the download has no hours in
+    it — so its cost series is still imported (and stale rows on covered days
+    zeroed); unpriced periods are omitted.
+    """
+    hourly = _period_hourly(readings, plan)
+    return {
+        period: [(start, kwh * rate / 100.0) for start, kwh in hourly.get(period, [])]
+        for period, rate in prices.items()
+    }
 
 
 def _tier_cost_hourly(
@@ -396,18 +407,101 @@ def _flatten_points(readings: Iterable[UsageReading]) -> list[tuple[datetime, fl
     )
 
 
-def _build_statistics(
+# The download window as UTC hour bounds ``(window_start, window_end)``, both
+# inclusive: the first hour of the first downloaded local day through the last
+# hour of the last one. Shared by every series of a meter.
+Window = tuple[datetime, datetime]
+
+
+def download_window(from_date: date, today: date) -> Window:
+    """The UTC hour bounds of a download covering local dates ``from_date..today``."""
+    start = datetime.combine(from_date, time(0), tzinfo=TIME_ZONE)
+    end = datetime.combine(today, time(23), tzinfo=TIME_ZONE)
+    return start.astimezone(timezone.utc), end.astimezone(timezone.utc)
+
+
+def days_covered(readings: Iterable[UsageReading]) -> set[date]:
+    """Local dates the download actually reported (≥ 1 published hour)."""
+    return {r.date for r in readings if any(kwh is not None for _, kwh in r.intervals())}
+
+
+def _stored_rows(
+    hass: HomeAssistant, statistic_ids: set[str], start: datetime
+) -> dict[str, list[tuple[datetime, float]]]:
+    """Stored ``(start_utc, sum)`` rows from ``start`` on, ascending per id (executor).
+
+    One batched read for all of a meter's series. Rows the recorder returns
+    without a usable start or sum are skipped — there is no increment to keep.
+    """
+    result = statistics_during_period(
+        hass, start, None, statistic_ids, "hour", None, {"sum"}
+    )
+    return {
+        statistic_id: sorted(
+            (start_utc, float(row["sum"]))
+            for row in rows
+            if (start_utc := _normalize_start(row.get("start"))) is not None
+            and row.get("sum") is not None
+        )
+        for statistic_id, rows in result.items()
+    }
+
+
+async def _async_stored_rows(
+    hass: HomeAssistant, statistic_ids: set[str], start: datetime
+) -> dict[str, list[tuple[datetime, float]]]:
+    """Async wrapper for :func:`_stored_rows`."""
+    return await get_instance(hass).async_add_executor_job(
+        _stored_rows, hass, statistic_ids, start
+    )
+
+
+def _merge_statistics(
     points: list[tuple[datetime, float]],
-    last_start: datetime | None,
     base_sum: float,
+    stored: list[tuple[datetime, float]],
+    window: Window,
+    covered: Callable[[datetime], bool],
 ) -> list[StatisticData]:
-    """Build forward-only statistics with a continuous cumulative sum."""
+    """The rows to write so the series is one continuous chain from the window on.
+
+    ``base_sum`` is the anchor's sum (the last stored row before the window; 0
+    if none) and ``stored`` the stored rows from ``window_start`` on, ascending.
+    ``covered(start)`` says whether the download covered that hour's local day.
+    Points must lie inside the window; stored rows before it are out of scope.
+    Returns ``[]`` when the chain would be unchanged (no points, nothing to zero).
+    """
+    window_start, window_end = window
+    # Sum the new points per hour (duplicate timestamps add up).
+    new: dict[datetime, float] = defaultdict(float)
+    for start, value in points:
+        new[start] += value
+
+    # Walk the stored rows in order, tracking each row's stored increment:
+    #   hour also in the new points        → the point replaces it
+    #   in-window hour on a covered day    → zero increment (no longer reported)
+    #   otherwise (uncovered day, or tail) → keep the stored increment
+    increments: dict[datetime, float] = dict(new)
+    zeroed = False
+    previous = base_sum
+    for start, stored_sum in stored:
+        if start < window_start:
+            continue
+        if start not in new:
+            if start <= window_end and covered(start):
+                increments[start] = 0.0
+                zeroed = True
+            else:
+                increments[start] = stored_sum - previous
+        previous = stored_sum
+    if not new and not zeroed:
+        return []
+
+    # Accumulate the increments in time order from the anchor sum.
     stats: list[StatisticData] = []
     running = base_sum
-    for start, value in points:
-        if last_start is not None and start <= last_start:
-            continue
-        running += value
+    for start, increment in sorted(increments.items()):
+        running += increment
         stats.append(StatisticData(start=start, state=running, sum=running))
     return stats
 
@@ -454,6 +548,11 @@ async def async_last_statistic_start(
     return _normalize_start(row.get("start")) if row else None
 
 
+def _priced(plan: str, rates: list[TariffRate], tiered: TieredRates | None) -> bool:
+    """Whether ``plan``'s energy cost can be computed from the scraped rates."""
+    return tiered is not None if plan == PLAN_TIERED else bool(plan_prices(rates, plan))
+
+
 def expected_statistic_ids(
     meter_id: str, plan: str, rates: list[TariffRate], tiered: TieredRates | None
 ) -> list[str]:
@@ -479,10 +578,7 @@ def expected_statistic_ids(
     if tiered:
         ids += [bucket_cost_statistic_id(meter_id, key) for key in TIER_BUCKETS]
 
-    active_priced = (
-        tiered is not None if plan == PLAN_TIERED else bool(plan_prices(rates, plan))
-    )
-    if active_priced:
+    if _priced(plan, rates, tiered):
         ids.append(cost_statistic_id(meter_id))
     if tou_prices:
         ids.append(cost_if_statistic_id(meter_id, PLAN_TOU))
@@ -558,39 +654,61 @@ async def _async_import_series(
     points: list[tuple[datetime, float]],
     unit: str,
     *,
+    window: Window,
+    covered_days: set[date],
     fresh: bool = False,
+    stored: list[tuple[datetime, float]] | None = None,
 ) -> float | None:
-    """Import one forward-only sum statistic series.
+    """Import one cumulative-sum statistic series over the download ``window``.
 
     Returns the series' cumulative sum after the import — the value its last
     row will carry once the recorder flushes (computed here rather than read
     back, since recorder writes are queued) — or None if the series has never
     stored a point.
 
-    When the window overlaps stored rows (the portal publishes a day as a
-    preliminary total-in-the-first-hour row and revises it to real hourly
-    values later), the import anchors on the last stored row *before* the
-    window, re-derives sums from there, and re-imports the window — updating
-    the overlapping rows in place instead of silently skipping the revision.
+    When stored rows exist from ``window_start`` on, the import anchors on the
+    last stored row *before* the window and rewrites one continuous chain over
+    the stored rows and the new points (see ``_merge_statistics``); otherwise
+    it appends after the newest stored row with no further read. ``stored``
+    carries the meter-wide batched read (None → read this series now).
 
     With ``fresh=True`` any stored rows are ignored (sum restarts at zero,
     nothing is filtered): used by the format rebuild, whose queued clear may
     not have executed yet when this runs.
     """
-    row = None if fresh else await _async_last_row(hass, statistic_id)
-    newest = _normalize_start(row.get("start")) if row else None
-    if newest is not None and points and newest >= points[0][0]:
-        # Stored rows overlap the window: rewrite it from the anchor.
-        anchor = await _async_row_before(hass, statistic_id, points[0][0])
-        base_sum = (anchor.get("sum") or 0.0) if anchor else 0.0
-        last_start = _normalize_start(anchor.get("start")) if anchor else None
-    else:
-        # No overlap: plain append after the newest stored row.
-        base_sum = (row.get("sum") or 0.0) if row else 0.0
-        last_start = newest
+    window_start, window_end = window
+    inside = [p for p in points if window_start <= p[0] <= window_end]
+    if len(inside) != len(points):
+        LOGGER.warning(
+            "Dropping %d points outside the download window for %s",
+            len(points) - len(inside),
+            statistic_id,
+        )
 
-    stats = _build_statistics(points, last_start, base_sum)
+    row = None
+    if fresh:
+        stored, base_sum = [], 0.0
+    else:
+        if stored is None:
+            stored = (await _async_stored_rows(hass, {statistic_id}, window_start)).get(
+                statistic_id, []
+            )
+        if stored:
+            # Stored rows overlap the window: rewrite the chain from the anchor.
+            row = await _async_row_before(hass, statistic_id, window_start)
+        else:
+            # Pure append: the newest stored row is the anchor.
+            row = await _async_last_row(hass, statistic_id)
+        base_sum = (row.get("sum") or 0.0) if row else 0.0
+
+    def covered(start: datetime) -> bool:
+        return start.astimezone(TIME_ZONE).date() in covered_days
+
+    stats = _merge_statistics(inside, base_sum, stored, window, covered)
     if not stats:
+        # Chain unchanged: the series still ends on its last stored sum.
+        if stored:
+            return stored[-1][1]
         return base_sum if row else None
 
     # unit_class must be stated explicitly (required from HA 2026.11):
@@ -620,9 +738,17 @@ async def async_import_meter(
     periods: list[BillingPeriod],
     currency: str,
     *,
+    window: Window,
+    covered_days: set[date],
     rebuild: bool = False,
 ) -> float | None:
     """Import a meter's consumption, all buckets, active cost, and cost_if_* series.
+
+    ``window`` and ``covered_days`` describe the download ``readings`` came
+    from (see ``download_window`` / ``days_covered``); every series is
+    rewritten over that same window. Cost series whose scheme has no rates
+    are not imported at all — their stored rows stay untouched rather than
+    being zeroed as "no longer reported".
 
     ``rebuild=True`` re-imports every series from scratch, consumption
     included (see ``async_start_rebuild`` and ``rebuild_statistic_ids``).
@@ -631,55 +757,74 @@ async def async_import_meter(
     since the first backfill (None until anything has been stored).
     """
     kwh = UnitOfEnergy.KILO_WATT_HOUR
-    total = await _async_import_series(
-        hass,
-        consumption_statistic_id(meter_id),
-        f"Enova Power consumption ({meter_id})",
-        _flatten_points(readings),
-        kwh,
-        fresh=rebuild,
-    )
-
-    for key, points in bucket_points(readings, periods).items():
-        await _async_import_series(
-            hass,
+    series: list[tuple[str, str, list[tuple[datetime, float]], str]] = [
+        (
+            consumption_statistic_id(meter_id),
+            f"Enova Power consumption ({meter_id})",
+            _flatten_points(readings),
+            kwh,
+        )
+    ]
+    series += [
+        (
             bucket_statistic_id(meter_id, key),
             f"Enova Power {key.replace('_', ' ')} ({meter_id})",
             points,
             kwh,
-            fresh=rebuild,
         )
-
-    # Per-bucket energy cost, pairable with the kWh buckets in the Energy dashboard.
-    for key, points in bucket_cost_points(readings, rates, tiered, periods).items():
-        await _async_import_series(
-            hass,
+        for key, points in bucket_points(readings, periods).items()
+    ]
+    # Per-bucket energy cost, pairable with the kWh buckets in the Energy
+    # dashboard (bucket_cost_points already omits unpriced schemes).
+    series += [
+        (
             bucket_cost_statistic_id(meter_id, key),
             f"Enova Power {key.replace('_', ' ')} cost ({meter_id})",
             points,
             currency,
-            fresh=rebuild,
         )
-
-    # Active-plan energy cost.
-    await _async_import_series(
-        hass,
-        cost_statistic_id(meter_id),
-        f"Enova Power energy cost ({meter_id})",
-        cost_points(readings, plan, rates, tiered, periods),
-        currency,
-        fresh=rebuild,
-    )
-
-    # What-if energy cost under each plan (plan comparison).
-    for scheme_plan in (PLAN_TOU, PLAN_ULO, PLAN_TIERED):
-        await _async_import_series(
-            hass,
+        for key, points in bucket_cost_points(readings, rates, tiered, periods).items()
+    ]
+    if _priced(plan, rates, tiered):
+        series.append(
+            (
+                cost_statistic_id(meter_id),
+                f"Enova Power energy cost ({meter_id})",
+                cost_points(readings, plan, rates, tiered, periods),
+                currency,
+            )
+        )
+    # What-if energy cost under each priced plan (plan comparison).
+    series += [
+        (
             cost_if_statistic_id(meter_id, scheme_plan),
             f"Enova Power cost if {_SCHEME[scheme_plan]} ({meter_id})",
             cost_points(readings, scheme_plan, rates, tiered, periods),
             currency,
-            fresh=rebuild,
         )
+        for scheme_plan in (PLAN_TOU, PLAN_ULO, PLAN_TIERED)
+        if _priced(scheme_plan, rates, tiered)
+    ]
 
-    return total
+    # One batched read of every series' stored rows from the window on; a
+    # rebuild ignores stored rows, so it skips the read.
+    stored = (
+        {}
+        if rebuild
+        else await _async_stored_rows(hass, {sid for sid, *_ in series}, window[0])
+    )
+    totals = [
+        await _async_import_series(
+            hass,
+            statistic_id,
+            name,
+            points,
+            unit,
+            window=window,
+            covered_days=covered_days,
+            fresh=rebuild,
+            stored=stored.get(statistic_id, []),
+        )
+        for statistic_id, name, points, unit in series
+    ]
+    return totals[0]
