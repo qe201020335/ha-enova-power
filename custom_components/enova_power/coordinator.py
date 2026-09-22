@@ -145,11 +145,13 @@ class EnovaPowerCoordinator(DataUpdateCoordinator[dict[str, "MeterData"]]):
         # Account-wide scraped tariff rates (all plans), refreshed each cycle and
         # read by the rate-card and current-rate sensors. Empty until first fetch.
         self.rates: list[TariffRate] = []
-        # Statistics-format rebuild pending: setup queued a clear of the old
-        # series (see statistics.async_start_rebuild); this cycle must re-import
-        # them from scratch over the full backfill window. Stamped complete
-        # (and the flag dropped) only after a fully successful cycle, so any
-        # failure retries the whole rebuild idempotently.
+        # One-time repair pending: the entry's series were last imported under
+        # an older STATS_VERSION, so every meter's first cycle is forced through
+        # a full re-import from its oldest stored date (see
+        # ``_full_reimport_from`` and heal rule 3) regardless of what the
+        # integrity check finds — no clear, in place. Stamped complete (and the
+        # flag dropped) only after a fully successful cycle, so any failure
+        # retries the whole repair idempotently.
         self._rebuild = entry.data.get(CONF_STATS_VERSION, 1) < STATS_VERSION
         # Statistics integrity (see ``_download_from``): a cumulative sum that
         # falls means stored history is broken; the fix is a full re-import
@@ -193,15 +195,15 @@ class EnovaPowerCoordinator(DataUpdateCoordinator[dict[str, "MeterData"]]):
         except EnovaError as err:  # also covers EnovaNetworkError + parse/form errors
             raise UpdateFailed(str(err)) from err
         if self._rebuild:
-            # All meters re-imported in the new format; record it so the next
-            # setup doesn't rebuild again. Runs before the entry's update
-            # listener is registered (first refresh), so no reload is triggered.
+            # Every meter repaired; record it so the next setup doesn't repair
+            # again. Runs before the entry's update listener is registered
+            # (first refresh), so no reload is triggered.
             self._rebuild = False
             entry = self.config_entry
             self.hass.config_entries.async_update_entry(
                 entry, data={**entry.data, CONF_STATS_VERSION: STATS_VERSION}
             )
-            LOGGER.info("Statistics format rebuild complete (v%s)", STATS_VERSION)
+            LOGGER.info("Statistics repair complete (v%s)", STATS_VERSION)
         return data
 
     async def _update_meter(
@@ -229,7 +231,6 @@ class EnovaPowerCoordinator(DataUpdateCoordinator[dict[str, "MeterData"]]):
             CURRENCY,
             window=download_window(from_date, today),
             covered_days=days_covered(readings),
-            rebuild=self._rebuild,
         )
         if healing:
             self._finish_heal(meter_id, result.broken, today)
@@ -262,17 +263,17 @@ class EnovaPowerCoordinator(DataUpdateCoordinator[dict[str, "MeterData"]]):
 
         A heal is due when one is pending and the meter was not already
         healed today; drops found by the startup scan are healed right away.
+        A pending ``STATS_VERSION`` repair (``self._rebuild``) forces every
+        meter's first cycle to heal too, regardless of what the check finds —
+        the startup scan still runs first so ``_full_reimport_from`` has an
+        oldest date to work from (see heal rule 3).
         """
-        if self._rebuild:
-            # Format rebuild: full backfill window, and skip the recorder checks
-            # — the queued clear may not have run yet, so stored rows can't be
-            # trusted either way (the fresh imports ignore them).
-            last_start, healing = None, False
-        else:
-            last_start = await self._incremental_start(meter_id, ids)
-            if meter_id not in self._scanned:
-                await self._startup_scan(meter_id, ids)
-            healing = meter_id in self._heal_pending and self._last_heal.get(meter_id) != today
+        last_start = await self._incremental_start(meter_id, ids)
+        if meter_id not in self._scanned:
+            await self._startup_scan(meter_id, ids)
+        healing = self._rebuild or (
+            meter_id in self._heal_pending and self._last_heal.get(meter_id) != today
+        )
 
         from_date = min(fetch_from_date(last_start, today), current_cycle_start(periods, today))
         if healing:

@@ -17,7 +17,7 @@ from homeassistant.helpers.aiohttp_client import async_create_clientsession
 
 from .const import CONF_STATS_VERSION, LOGGER
 from .coordinator import EnovaPowerCoordinator
-from .statistics import STATS_VERSION, async_start_rebuild
+from .statistics import STATS_VERSION
 
 PLATFORMS: list[Platform] = [Platform.SENSOR]
 
@@ -49,20 +49,21 @@ async def async_setup_entry(hass: HomeAssistant, entry: EnovaPowerConfigEntry) -
     if not client.meter_id:
         raise ConfigEntryNotReady("No Enova Power meter found for this account yet")
 
-    # One-time statistics-format rebuild (imports are forward-only, so
-    # granularity can't change in place): queue clearing the outdated series —
-    # fire-and-forget, NEVER awaited, since the recorder holds its queue until
-    # HA has fully started and waiting here deadlocks bootstrap. The
-    # coordinator's first refresh re-imports those series from scratch and
-    # stamps CONF_STATS_VERSION once the rebuild cycle succeeds.
+    # One-time statistics repair: the coordinator's first refresh re-imports
+    # every meter's series in place from its oldest stored date and stamps
+    # CONF_STATS_VERSION once that cycle succeeds (see
+    # EnovaPowerCoordinator._rebuild / statistics.STATS_VERSION). Nothing is
+    # cleared here or anywhere else in the repair — setup never awaits the
+    # recorder queue (it isn't drained until HA has fully started; waiting on
+    # it here would deadlock bootstrap), and the repair no longer needs a
+    # clear to begin with, since the in-place merge rewrites any window.
     if entry.data.get(CONF_STATS_VERSION, 1) < STATS_VERSION:
         LOGGER.info(
-            "Statistics format changed (v%s -> v%s); rebuilding bucket and "
-            "cost series at hourly granularity",
+            "Statistics format changed (v%s -> v%s); repairing every series "
+            "in place from its oldest stored date on the first refresh",
             entry.data.get(CONF_STATS_VERSION, 1),
             STATS_VERSION,
         )
-        async_start_rebuild(hass, client.meter_ids)
 
     coordinator = EnovaPowerCoordinator(hass, entry, client)
     await coordinator.async_config_entry_first_refresh()

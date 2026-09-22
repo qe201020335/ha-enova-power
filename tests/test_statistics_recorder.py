@@ -10,13 +10,23 @@ from __future__ import annotations
 
 import logging
 from datetime import date, datetime, timezone
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from enovapower import BillingPeriod
 
 from homeassistant.components.recorder import get_instance
-from homeassistant.components.recorder.statistics import statistics_during_period
+from homeassistant.components.recorder.models import (
+    StatisticData,
+    StatisticMeanType,
+    StatisticMetaData,
+)
+from homeassistant.components.recorder.statistics import (
+    STATISTIC_UNIT_TO_UNIT_CONVERTER,
+    async_add_external_statistics,
+    statistics_during_period,
+)
+from homeassistant.const import UnitOfEnergy
 from homeassistant.core import HomeAssistant
 from pytest_homeassistant_custom_component.components.recorder.common import (
     async_wait_recording_done,
@@ -24,24 +34,31 @@ from pytest_homeassistant_custom_component.components.recorder.common import (
 
 from custom_components.enova_power.const import (
     CONF_STATS_VERSION,
+    DOMAIN,
     PLAN_TIERED,
     PLAN_TOU,
     TIME_ZONE,
 )
 from custom_components.enova_power.statistics import (
     STATS_VERSION,
+    _flatten_points,
     async_import_meter,
     async_scan_series,
+    bucket_cost_points,
     bucket_cost_statistic_id,
+    bucket_points,
     bucket_statistic_id,
     consumption_statistic_id,
+    cost_if_statistic_id,
+    cost_points,
+    cost_statistic_id,
     days_covered,
     download_window,
     expected_statistic_ids,
     tiered_rates,
 )
 
-from .test_coordinator import _coordinator
+from .test_coordinator import _coordinator, _freeze_today
 from .test_statistics import TIER_RATES, TOU_RATES, _reading
 
 METER = "111"
@@ -71,15 +88,63 @@ async def _import(
     rates: list = TOU_RATES,
     tiered=None,
     periods: list[BillingPeriod] | None = None,
-    rebuild: bool = False,
 ) -> None:
     """Import ``readings`` as the coordinator would for a download of ``from_date..today``."""
     await async_import_meter(
         hass, METER, readings, plan, rates, tiered, periods or [], "CAD",
         window=download_window(from_date, today),
         covered_days=days_covered(readings),
-        rebuild=rebuild,
     )
+    await async_wait_recording_done(hass)
+
+
+def _tou_series(readings: list) -> list[tuple[str, str, list[tuple[datetime, float]], str]]:
+    """The ``(statistic_id, name, points, unit)`` tuples ``async_import_meter`` builds for
+    the TOU plan at ``TOU_RATES`` with no billing periods — mirrors its series list so
+    ``_write_fresh`` below covers the same ids."""
+    kwh = UnitOfEnergy.KILO_WATT_HOUR
+    series: list[tuple[str, str, list[tuple[datetime, float]], str]] = [
+        (consumption_statistic_id(METER), "consumption", _flatten_points(readings), kwh),
+    ]
+    series += [
+        (bucket_statistic_id(METER, key), key, points, kwh)
+        for key, points in bucket_points(readings, []).items()
+    ]
+    series += [
+        (bucket_cost_statistic_id(METER, key), key, points, "CAD")
+        for key, points in bucket_cost_points(readings, TOU_RATES, None, []).items()
+    ]
+    cost = cost_points(readings, PLAN_TOU, TOU_RATES, None, [])
+    series.append((cost_statistic_id(METER), "cost", cost, "CAD"))
+    series.append((cost_if_statistic_id(METER, PLAN_TOU), "cost_if_tou", cost, "CAD"))
+    return series
+
+
+async def _write_fresh(hass: HomeAssistant, readings: list) -> None:
+    """Write every TOU series' points as one chain restarting from zero, bypassing the
+    merge/anchor machinery entirely — no current import path can do this (every write
+    reads and rewrites its window in place), but legacy (pre-0.5.11) corruption already
+    sitting in a database looks exactly like this: a series' sum restarting instead of
+    continuing. Used to plant that shape directly for the repair tests to heal."""
+    for statistic_id, name, points, unit in _tou_series(readings):
+        if not points:
+            continue
+        running = 0.0
+        stats = []
+        for start, value in sorted(points):
+            running += value
+            stats.append(StatisticData(start=start, state=running, sum=running))
+        converter = STATISTIC_UNIT_TO_UNIT_CONVERTER.get(unit)
+        metadata = StatisticMetaData(
+            mean_type=StatisticMeanType.NONE,
+            has_sum=True,
+            name=name,
+            source=DOMAIN,
+            statistic_id=statistic_id,
+            unit_of_measurement=unit,
+            unit_class=converter.UNIT_CLASS if converter else None,
+        )
+        async_add_external_statistics(hass, metadata, stats)
     await async_wait_recording_done(hass)
 
 
@@ -110,8 +175,8 @@ async def test_incremental_day_lands_hourly_after_rebuild(
 ) -> None:
     day1, day2 = date(2026, 7, 1), date(2026, 7, 2)
 
-    # Cycle 1 — the format rebuild: fresh import of complete history.
-    await _import(hass, [_full_day(day1)], day1, day1, rebuild=True)
+    # Cycle 1 — first import of complete history.
+    await _import(hass, [_full_day(day1)], day1, day1)
     assert len(await _hourly_rows(hass, consumption_statistic_id(METER))) == 24
 
     # Cycle 2 — incremental: the window still contains day 1; day 2 is new.
@@ -247,10 +312,11 @@ def _chain(hours: int, base: float = 0.0) -> list[float]:
 
 async def _plant_july_pattern(hass: HomeAssistant) -> None:
     """Reproduce the July incident: Jul 1–2 stored as one chain, Jul 10
-    imported on a zero base (its sum restarts), Jul 15 appended after it.
+    planted on a zero base (its sum restarts, as legacy corruption already in
+    the database would look — see ``_write_fresh``), Jul 15 appended after it.
     Every series with a Jul 10 row has its sum fall there."""
     await _import(hass, [_full_day(JUL1, KWH), _full_day(JUL2, KWH)], JUL1, JUL2)
-    await _import(hass, [_full_day(JUL10, KWH)], JUL10, JUL10, rebuild=True)
+    await _write_fresh(hass, [_full_day(JUL10, KWH)])
     await _import(hass, [_full_day(JUL15, KWH)], JUL15, JUL15)
     rows = await _hourly_rows(hass, consumption_statistic_id(METER))
     assert [r["sum"] for r in rows] == _chain(48) + _chain(48)
@@ -339,3 +405,50 @@ async def test_DW_2_4_startup_scan_heals_break_outside_window(
     assert coord._pre_heal == {}
     assert coord._unhealable == set()
     assert coord._heal_pending == set()
+
+
+async def test_DW_3_1_v4_upgrade_repairs_in_place_with_one_download(
+    recorder_mock, hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A v4 entry with the planted July pattern (a broken consumption chain and,
+    as part of the same event, stale tier1/tier2 rows) upgrades to v5: the first
+    refresh must do exactly one full download from the oldest stored date, never
+    clear anything, leave every series clean, land on the real July total, and
+    stamp the entry once it succeeds."""
+    await _plant_july_pattern(hass)
+    clear_statistics = MagicMock()
+    monkeypatch.setattr(get_instance(hass), "async_clear_statistics", clear_statistics)
+
+    period = BillingPeriod(date(2026, 6, 30), date(2026, 7, 12), 12, 0.0, 0.0)
+    coord = _coordinator(hass, detected=PLAN_TOU, data={CONF_STATS_VERSION: 4})
+    coord.client.meter_ids = [METER]
+    coord.client.billing_periods = AsyncMock(return_value=[period])
+    coord.client.download_tariff = AsyncMock(return_value=TOU_RATES)
+    published = {d: _full_day(d, KWH) for d in (JUL1, JUL2, JUL10, JUL15)}
+
+    async def download_usage(from_date: date, to_date: date, *, meter_id: str) -> list:
+        return [r for d, r in published.items() if from_date <= d <= to_date]
+
+    coord.client.download_usage = AsyncMock(side_effect=download_usage)
+    today = date(2026, 7, 20)
+    _freeze_today(monkeypatch, today)
+
+    await coord._async_update_data()
+    await async_wait_recording_done(hass)
+
+    # Exactly one full download, from the oldest stored date — not the 12-month
+    # backfill window and not a rebuild download plus a separate heal.
+    assert coord.client.download_usage.call_count == 1
+    assert coord.client.download_usage.call_args.args[:2] == (JUL1, today)
+    clear_statistics.assert_not_called()
+    assert coord.config_entry.data[CONF_STATS_VERSION] == STATS_VERSION
+
+    # Every series — consumption and tier1/tier2 included — is clean, and the
+    # July total (4 days × 24h × KWH) matches real usage, not the broken chain.
+    await _assert_no_drops(hass, TOU_IDS)
+    rows = await _hourly_rows(hass, consumption_statistic_id(METER))
+    assert rows[-1]["sum"] == 96 * KWH
+
+    tier2 = await _hourly_rows(hass, bucket_statistic_id(METER, "tier2"))
+    sums = [r["sum"] for r in tier2]
+    assert sums == sorted(sums)  # no oscillation / stale plateaus left behind

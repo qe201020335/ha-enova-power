@@ -6,9 +6,8 @@ a live sensor): this backfills the Energy dashboard with real history.
 All series are **hourly** — the source's own resolution (the portal publishes
 ``h01``–``h24`` per day) and the finest granularity long-term statistics can
 hold — so hourly charts attribute buckets and costs to the hours the energy
-was used. ``STATS_VERSION`` tracks this format: bumping it makes setup clear
-and rebuild the affected series from a full re-download (imports are
-forward-only, so a granularity change can't be fixed in place).
+was used. ``STATS_VERSION`` tracks this format (and, as of v5, forces a
+one-time repair of already-stored series; see below).
 
 Buckets are **usage classifications**, computed from the hourly intervals by
 local Ontario wall-clock time (verified to match the portal's own TOU totals —
@@ -49,7 +48,16 @@ must never fall, so ``find_sum_drops`` over the anchor plus the stored rows
 reports every hour whose sum is below its predecessor's. ``async_import_meter``
 returns those per series (``ImportResult.broken``) and ``async_scan_series``
 runs the check over a series' full history once at startup; the coordinator
-heals a broken meter by re-importing it from its oldest stored date.
+heals a broken meter by re-importing it from its oldest stored date — the same
+in-place merge-and-check import used for every other cycle, no clear involved.
+``STATS_VERSION`` triggers that heal unconditionally once per entry: bumping it
+makes the coordinator's first refresh treat every meter as broken regardless of
+what the check finds, repairing whatever shape the previous version left behind
+(daily granularity, misclassified summer hours, or a corrupted sum) from the
+meter's oldest stored date. There is no separate rebuild path any more — imports
+are still forward-only in the sense that they never invent history the portal
+doesn't return, but a version bump no longer needs one, because the merge
+already rewrites any window in place.
 """
 
 from __future__ import annotations
@@ -674,48 +682,20 @@ def expected_statistic_ids(
     return ids
 
 
-# Statistics format version, stamped into the config entry after a rebuild.
-# Bump when the shape of already-imported series changes. Version 2 = hourly
-# bucket/cost granularity (version 1 imported one point per day). Version 3 =
-# local-wall-clock timestamps (fixed-EST interpretation put summer hours one
-# hour late). Version 4 = heal days permanently locked in their preliminary
-# published shape (whole total in the first hour) by the old forward-only
-# import; the import now rewrites overlapping windows, but days that had
-# already rolled out of the download window need this one-time rebuild.
-STATS_VERSION = 4
-
-
-def rebuild_statistic_ids(meter_id: str) -> list[str]:
-    """The statistic ids cleared for a format rebuild — every series.
-
-    Consumption is included: the v3 timestamp fix moves its summer points, so
-    its history must be re-imported like everything else.
-    """
-    ids = [consumption_statistic_id(meter_id)]
-    ids += [bucket_statistic_id(meter_id, key) for key in ALL_BUCKET_KEYS]
-    ids += [bucket_cost_statistic_id(meter_id, key) for key in ALL_BUCKET_KEYS]
-    ids.append(cost_statistic_id(meter_id))
-    ids += [
-        cost_if_statistic_id(meter_id, plan)
-        for plan in (PLAN_TOU, PLAN_ULO, PLAN_TIERED)
-    ]
-    return ids
-
-
-def async_start_rebuild(hass: HomeAssistant, meter_ids: list[str]) -> None:
-    """Queue clearing of the outdated-format series. Fire-and-forget by design.
-
-    The recorder does not process its task queue until Home Assistant has
-    fully started, so setup must never *wait* on it — during bootstrap that
-    deadlocks into the stage-2 timeout and setup gets cancelled. Correctness
-    doesn't need the wait: the rebuild cycle imports these series with
-    ``rebuild=True`` (ignoring whatever rows are still stored), and the
-    recorder executes this clear before those imports because both go through
-    its queue in order.
-    """
-    ids = [sid for meter_id in meter_ids for sid in rebuild_statistic_ids(meter_id)]
-    get_instance(hass).async_clear_statistics(ids)
-    LOGGER.info("Queued %d statistics series to be cleared for a format rebuild", len(ids))
+# Statistics format version, stamped into the config entry after a successful
+# repair cycle. Bump to force every meter through one full in-place re-import
+# from its oldest stored date (see ``EnovaPowerCoordinator._full_reimport_from``
+# and heal rule 3), regardless of what the integrity check finds — the same
+# merge-and-check machinery as any other heal, no clear involved. Version 2 =
+# hourly bucket/cost granularity (version 1 imported one point per day).
+# Version 3 = local-wall-clock timestamps (fixed-EST interpretation put summer
+# hours one hour late). Version 4 = heal days permanently locked in their
+# preliminary published shape (whole total in the first hour) by the old
+# forward-only import. Version 5 = repair only, no format change: heals the
+# July-2026-style sum drops and stale tier rows a stale/incomplete read could
+# leave behind, in place, from each meter's oldest stored date — history older
+# than the 12-month backfill window is never lost, since nothing is cleared.
+STATS_VERSION = 5
 
 
 def _missing_series(hass: HomeAssistant, ids: list[str]) -> list[str]:
@@ -741,7 +721,6 @@ async def _async_import_series(
     *,
     window: Window,
     covered_days: set[date],
-    fresh: bool = False,
     stored: list[tuple[datetime, float]] | None = None,
 ) -> SeriesResult:
     """Import one cumulative-sum statistic series over the download ``window``.
@@ -758,10 +737,6 @@ async def _async_import_series(
     it appends after the newest stored row with no further read — and no
     check, since nothing overlapping was read. ``stored`` carries the
     meter-wide batched read (None → read this series now).
-
-    With ``fresh=True`` any stored rows are ignored (sum restarts at zero,
-    nothing is filtered): used by the format rebuild, whose queued clear may
-    not have executed yet when this runs.
     """
     window_start, window_end = window
     inside = [p for p in points if window_start <= p[0] <= window_end]
@@ -774,23 +749,20 @@ async def _async_import_series(
 
     row = None
     drops: list[datetime] = []
-    if fresh:
-        stored, base_sum = [], 0.0
+    if stored is None:
+        stored = (await _async_stored_rows(hass, {statistic_id}, window_start)).get(
+            statistic_id, []
+        )
+    if stored:
+        # Stored rows overlap the window: rewrite the chain from the anchor,
+        # and check the chain the read saw (anchor first).
+        row = await _async_row_before(hass, statistic_id, window_start)
+        anchor = _row_point(row)
+        drops = find_sum_drops(([anchor] if anchor else []) + stored)
     else:
-        if stored is None:
-            stored = (await _async_stored_rows(hass, {statistic_id}, window_start)).get(
-                statistic_id, []
-            )
-        if stored:
-            # Stored rows overlap the window: rewrite the chain from the anchor,
-            # and check the chain the read saw (anchor first).
-            row = await _async_row_before(hass, statistic_id, window_start)
-            anchor = _row_point(row)
-            drops = find_sum_drops(([anchor] if anchor else []) + stored)
-        else:
-            # Pure append: the newest stored row is the anchor.
-            row = await _async_last_row(hass, statistic_id)
-        base_sum = (row.get("sum") or 0.0) if row else 0.0
+        # Pure append: the newest stored row is the anchor.
+        row = await _async_last_row(hass, statistic_id)
+    base_sum = (row.get("sum") or 0.0) if row else 0.0
 
     def covered(start: datetime) -> bool:
         return start.astimezone(TIME_ZONE).date() in covered_days
@@ -831,18 +803,17 @@ async def async_import_meter(
     *,
     window: Window,
     covered_days: set[date],
-    rebuild: bool = False,
 ) -> ImportResult:
     """Import a meter's consumption, all buckets, active cost, and cost_if_* series.
 
     ``window`` and ``covered_days`` describe the download ``readings`` came
     from (see ``download_window`` / ``days_covered``); every series is
-    rewritten over that same window. Cost series whose scheme has no rates
-    are not imported at all — their stored rows stay untouched rather than
-    being zeroed as "no longer reported".
-
-    ``rebuild=True`` re-imports every series from scratch, consumption
-    included (see ``async_start_rebuild`` and ``rebuild_statistic_ids``).
+    rewritten over that same window — including a full re-import from the
+    meter's oldest stored date, when the coordinator sets ``window`` that far
+    back (a heal, or the one-time ``STATS_VERSION`` repair; see
+    ``EnovaPowerCoordinator._full_reimport_from``). Cost series whose scheme
+    has no rates are not imported at all — their stored rows stay untouched
+    rather than being zeroed as "no longer reported".
 
     Returns the consumption series' cumulative sum — the meter's lifetime kWh
     since the first backfill (None until anything has been stored) — and, per
@@ -898,13 +869,8 @@ async def async_import_meter(
         if _priced(scheme_plan, rates, tiered)
     ]
 
-    # One batched read of every series' stored rows from the window on; a
-    # rebuild ignores stored rows, so it skips the read.
-    stored = (
-        {}
-        if rebuild
-        else await _async_stored_rows(hass, {sid for sid, *_ in series}, window[0])
-    )
+    # One batched read of every series' stored rows from the window on.
+    stored = await _async_stored_rows(hass, {sid for sid, *_ in series}, window[0])
     results = [
         await _async_import_series(
             hass,
@@ -914,7 +880,6 @@ async def async_import_meter(
             unit,
             window=window,
             covered_days=covered_days,
-            fresh=rebuild,
             stored=stored.get(statistic_id, []),
         )
         for statistic_id, name, points, unit in series

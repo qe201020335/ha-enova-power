@@ -44,7 +44,6 @@ from custom_components.enova_power.statistics import (
     expected_statistic_ids,
     find_sum_drops,
     plan_prices,
-    rebuild_statistic_ids,
     season_threshold,
     tiered_rates,
 )
@@ -306,98 +305,6 @@ async def test_missing_series(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     ids = ["enova_power:energy_consumption_111", "enova_power:cost_tou_on_peak_111"]
     assert _missing_series(None, ids) == ["enova_power:cost_tou_on_peak_111"]
-
-
-# --- statistics-format rebuild ------------------------------------------------ #
-
-
-async def test_rebuild_ids_cover_every_series() -> None:
-    ids = rebuild_statistic_ids("111")
-    # consumption + 9 kWh buckets + 9 cost buckets + energy_cost + 3 cost_if.
-    assert len(ids) == 23
-    # v3 moves timestamps, so consumption rebuilds too.
-    assert consumption_statistic_id("111") in ids
-    assert bucket_statistic_id("111", "tou_on_peak") in ids
-    assert bucket_cost_statistic_id("111", "tier2") in ids
-    assert cost_statistic_id("111") in ids
-    assert cost_if_statistic_id("111", PLAN_ULO) in ids
-    # Rate-gating must not apply here: clear everything that may exist.
-    assert set(ids) >= set(expected_statistic_ids("111", PLAN_TOU, [], None))
-
-
-async def test_start_rebuild_queues_clear_for_all_meters(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    cleared: list[str] = []
-
-    class FakeRecorder:
-        # Mirrors Recorder.async_clear_statistics: queues onto the recorder
-        # thread. The rebuild must never wait on it — the recorder holds its
-        # queue until HA has started, so a wait deadlocks bootstrap.
-        def async_clear_statistics(self, ids):
-            cleared.extend(ids)
-
-    monkeypatch.setattr(statistics_module, "get_instance", lambda hass: FakeRecorder())
-
-    statistics_module.async_start_rebuild(None, ["111", "222"])
-
-    assert len(cleared) == 46
-    assert consumption_statistic_id("111") in cleared
-    assert bucket_statistic_id("111", "tier1") in cleared
-    assert bucket_cost_statistic_id("222", "ulo_overnight") in cleared
-
-
-async def test_import_series_fresh_ignores_stored_rows(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # A stale row exists (the queued clear hasn't executed yet); fresh=True
-    # must neither filter against it nor resume from its sum.
-    base = datetime(2026, 1, 1, 5, tzinfo=timezone.utc)
-    written = _patch_import(monkeypatch, {"start": base.replace(hour=7), "sum": 500.0})
-    points = [(base, 1.0), (base.replace(hour=6), 2.0)]
-
-    result = await _async_import_series(
-        None, "enova_power:x", "x", points, "kWh",
-        window=WINDOW, covered_days={JAN1}, fresh=True,
-    )
-
-    assert result == SeriesResult(3.0, [])  # nothing read → nothing checked
-    assert [s["sum"] for s in written] == [1.0, 3.0]
-
-
-async def test_import_meter_rebuild_reimports_everything(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    stale_row = {"start": datetime(2026, 6, 2, 0, tzinfo=timezone.utc), "sum": 500.0}
-    written: dict[str, list[float]] = {}
-
-    async def fake_last_row(hass, statistic_id):
-        return stale_row
-
-    monkeypatch.setattr(statistics_module, "_async_last_row", fake_last_row)
-    monkeypatch.setattr(
-        statistics_module,
-        "async_add_external_statistics",
-        lambda hass, metadata, stats: written.__setitem__(
-            metadata["statistic_id"], [s["sum"] for s in stats]
-        ),
-    )
-
-    readings = [_reading(date(2026, 6, 1), h01=10.0, h13=5.0)]
-    result = await statistics_module.async_import_meter(
-        None, "111", readings, PLAN_TOU, TOU_RATES, None, [], "CAD",
-        window=download_window(date(2026, 6, 1), date(2026, 6, 1)),
-        covered_days=days_covered(readings),
-        rebuild=True,
-    )
-
-    # Every series — consumption included (its timestamps moved in v3) —
-    # ignores the stale row (no stored-rows read either): full points, sums
-    # restarting from zero.
-    assert result == ImportResult(15.0, {})
-    assert written[consumption_statistic_id("111")] == [10.0, 15.0]
-    assert written[bucket_statistic_id("111", "tou_off_peak")] == [10.0]
-    assert written[bucket_cost_statistic_id("111", "tou_on_peak")] == pytest.approx([1.015])
 
 
 # --- window + covered days ----------------------------------------------------- #

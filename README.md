@@ -113,6 +113,11 @@ Semantics worth knowing:
   first publishes a day as a preliminary total-in-the-first-hour row and revises it to real
   hourly values a day later, and the re-import picks those revisions up. Re-imports are
   idempotent, and history older than the window survives restarts and re-installs untouched.
+- **Self-healing.** Every import checks the rows it just read for a cumulative sum that fell
+  instead of rose; a full check also runs once at startup. If either finds a break, the
+  affected meter's entire history re-imports from its oldest stored date on the next update —
+  in place, nothing is cleared, and no history older than what's stored can be lost. (Version
+  0.5.11 ran this once for every meter, to repair a sum-corruption bug from July 2026.)
 
 ## Energy dashboard
 
