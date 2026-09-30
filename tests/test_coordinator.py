@@ -14,9 +14,10 @@ from homeassistant.helpers.update_coordinator import UpdateFailed
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.enova_power.const import (
-    BACKFILL_MONTHS,
+    CONF_BACKFILL_MONTHS,
     CONF_PLAN,
     CONF_STATS_VERSION,
+    DEFAULT_BACKFILL_MONTHS,
     DEFAULT_PLAN,
     DOMAIN,
     PLAN_TOU,
@@ -46,7 +47,15 @@ P2 = BillingPeriod(date(2026, 6, 19), date(2026, 7, 20), 31, 0.0, 0.0)
 
 async def test_backfills_when_no_statistics() -> None:
     today = date(2026, 6, 1)
-    assert fetch_from_date(None, today) == today - timedelta(days=BACKFILL_MONTHS * 31)
+    assert fetch_from_date(None, today) == today - timedelta(days=DEFAULT_BACKFILL_MONTHS * 31)
+
+
+async def test_backfill_depth_is_configurable() -> None:
+    today = date(2026, 6, 1)
+    assert fetch_from_date(None, today, 16) == today - timedelta(days=16 * 31)
+    # An incremental window ignores the backfill depth.
+    last_start = datetime(2026, 5, 31, 5, tzinfo=timezone.utc)
+    assert fetch_from_date(last_start, today, 16) == fetch_from_date(last_start, today)
 
 
 async def test_incremental_uses_recent_window_when_current() -> None:
@@ -204,11 +213,14 @@ def _healing_coordinator(
     *,
     scan: dict[str, SeriesScan] | None = None,
     stats_version: int = STATS_VERSION,
+    data: dict | None = None,
 ) -> tuple[EnovaPowerCoordinator, AsyncMock, AsyncMock]:
     """A coordinator with every recorder seam stubbed; statistics are stored
     through yesterday and the startup scan returns ``scan`` (clean by default).
     Returns it with the ``async_import_meter`` and ``async_scan_series`` mocks."""
-    coord = _coordinator(hass, detected=PLAN_TOU, data={CONF_STATS_VERSION: stats_version})
+    coord = _coordinator(
+        hass, detected=PLAN_TOU, data={CONF_STATS_VERSION: stats_version, **(data or {})}
+    )
     coord.client.meter_ids = [METER]
     coord.client.billing_periods = AsyncMock(return_value=[])
     coord.client.download_usage = AsyncMock(return_value=[])
@@ -386,6 +398,21 @@ async def test_heal_without_oldest_date_uses_backfill_window(
     assert await _cycle(coord, import_meter, TODAY, {CONS: [T1]}) == backfill
 
 
+async def test_first_import_uses_configured_backfill_months(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Nothing stored yet: the download reaches back the entry's chosen depth.
+    coord, import_meter, _ = _healing_coordinator(
+        hass, monkeypatch, data={CONF_BACKFILL_MONTHS: 16}
+    )
+    monkeypatch.setattr(
+        coordinator_module, "async_last_statistic_start", AsyncMock(return_value=None)
+    )
+    expected = cycle_start_containing([], TODAY - timedelta(days=16 * 31))
+    assert await _cycle(coord, import_meter, TODAY, {}) == expected
+    assert expected < cycle_start_containing([], fetch_from_date(None, TODAY))
+
+
 async def test_heal_window_never_shrinks_the_normal_window(
     hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -452,7 +479,7 @@ async def test_DW_3_3_rebuild_reaches_past_backfill_window_for_old_history(
     hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Stored history predates the 12-month backfill window (the user's real
-    # case: rows back to 2025-07-01, older than BACKFILL_MONTHS would reach on
+    # case: rows back to 2025-07-01, older than DEFAULT_BACKFILL_MONTHS would reach on
     # its own). The repair must still start from the oldest stored date, not
     # get clamped to the backfill window.
     old_first_start = datetime(2024, 1, 1, 5, tzinfo=timezone.utc)
@@ -461,7 +488,7 @@ async def test_DW_3_3_rebuild_reaches_past_backfill_window_for_old_history(
         hass, monkeypatch, scan=scan, stats_version=1
     )
     assert await _cycle(coord, import_meter, TODAY, {}) == old_first_start.date()
-    backfill_limit = TODAY - timedelta(days=BACKFILL_MONTHS * 31)
+    backfill_limit = TODAY - timedelta(days=DEFAULT_BACKFILL_MONTHS * 31)
     assert old_first_start.date() < backfill_limit
 
 

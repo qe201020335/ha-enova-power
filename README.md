@@ -14,7 +14,7 @@ in the **Energy dashboard** with full history.
 
 Enova publishes smart-meter data a few days in arrears, so this integration does **not** use a
 live consumption sensor (which couldn't backfill history). Instead it imports hourly usage as
-external [long-term statistics](#long-term-statistics), backfilling ~12 months on first setup
+external [long-term statistics](#long-term-statistics), backfilling ~12 months (configurable at setup) on first setup
 and topping up every 30 minutes, and complements them with [per-meter
 sensors](#devices-and-sensors) for at-a-glance state and automations. Every meter on the
 account gets its own device and statistics series.
