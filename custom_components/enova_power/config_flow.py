@@ -18,12 +18,26 @@ from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import callback
 from homeassistant.helpers.aiohttp_client import async_create_clientsession
 
-from .const import CONF_PLAN, DEFAULT_PLAN, DOMAIN, LOGGER, PLANS
+from .const import (
+    CONF_BACKFILL_MONTHS,
+    CONF_PLAN,
+    DEFAULT_BACKFILL_MONTHS,
+    DEFAULT_PLAN,
+    DOMAIN,
+    LOGGER,
+    MAX_BACKFILL_MONTHS,
+    PLANS,
+)
 
+# The backfill depth only matters for the first import (and a series added by
+# an upgrade), so it is asked once here rather than offered as an option.
 STEP_USER_DATA_SCHEMA = vol.Schema(
     {
         vol.Required(CONF_USERNAME): str,
         vol.Required(CONF_PASSWORD): str,
+        vol.Optional(CONF_BACKFILL_MONTHS, default=DEFAULT_BACKFILL_MONTHS): vol.All(
+            vol.Coerce(int), vol.Range(min=1, max=MAX_BACKFILL_MONTHS)
+        ),
     }
 )
 

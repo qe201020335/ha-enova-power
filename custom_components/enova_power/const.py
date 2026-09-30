@@ -32,7 +32,11 @@ LOGGER = logging.getLogger(__package__)
 UPDATE_INTERVAL = timedelta(minutes=30)
 
 # How much history to pull on first setup (the library chunks >90-day ranges).
-BACKFILL_MONTHS = 12
+# Chosen per entry in the config flow; the default applies to entries created
+# before the option existed.
+CONF_BACKFILL_MONTHS = "backfill_months"
+DEFAULT_BACKFILL_MONTHS = 12
+MAX_BACKFILL_MONTHS = 60
 
 # How many recent days to re-fetch each cycle (portal data lags a few days).
 RECENT_DAYS = 5

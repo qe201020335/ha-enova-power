@@ -2,7 +2,8 @@
 
 Each cycle fetches usage per meter and imports it into Home Assistant long-term
 statistics. The download window is derived from the recorder (no in-memory flag):
-with no prior statistics it backfills ``BACKFILL_MONTHS`` of history once, and
+with no prior statistics it backfills the entry's configured months of history
+(``CONF_BACKFILL_MONTHS``) once, and
 thereafter fetches incrementally but always covers the current billing cycle so
 cycle-to-date totals are correct. Plans are resolved per meter (a subscriber can
 be on different plans per meter); an account-wide options value overrides
@@ -29,10 +30,11 @@ from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import (
-    BACKFILL_MONTHS,
+    CONF_BACKFILL_MONTHS,
     CONF_PLAN,
     CONF_STATS_VERSION,
     CURRENCY,
+    DEFAULT_BACKFILL_MONTHS,
     DEFAULT_PLAN,
     DOMAIN,
     LOGGER,
@@ -74,16 +76,20 @@ class MeterData:
     lifetime_energy: float | None  # kWh since first import (the LTS cumulative sum)
 
 
-def fetch_from_date(last_start: datetime | None, today: date) -> date:
+def fetch_from_date(
+    last_start: datetime | None,
+    today: date,
+    backfill_months: int = DEFAULT_BACKFILL_MONTHS,
+) -> date:
     """Choose the download start date.
 
-    No prior statistics → full historical backfill window. Otherwise an
-    incremental window: from just before the last stored point (to fill any gap
-    after downtime and catch late revisions), but never shorter than the recent
-    window.
+    No prior statistics → full historical backfill window of ``backfill_months``.
+    Otherwise an incremental window: from just before the last stored point (to
+    fill any gap after downtime and catch late revisions), but never shorter
+    than the recent window.
     """
     if last_start is None:
-        return today - timedelta(days=BACKFILL_MONTHS * 31)
+        return today - timedelta(days=backfill_months * 31)
     return min(last_start.date() - timedelta(days=1), today - timedelta(days=RECENT_DAYS))
 
 
@@ -142,6 +148,10 @@ class EnovaPowerCoordinator(DataUpdateCoordinator[dict[str, "MeterData"]]):
             config_entry=entry,
         )
         self.client = client
+        # History depth for a full backfill (chosen at setup).
+        self._backfill_months: int = entry.data.get(
+            CONF_BACKFILL_MONTHS, DEFAULT_BACKFILL_MONTHS
+        )
         # Account-wide scraped tariff rates (all plans), refreshed each cycle and
         # read by the rate-card and current-rate sensors. Empty until first fetch.
         self.rates: list[TariffRate] = []
@@ -275,10 +285,15 @@ class EnovaPowerCoordinator(DataUpdateCoordinator[dict[str, "MeterData"]]):
             meter_id in self._heal_pending and self._last_heal.get(meter_id) != today
         )
 
-        from_date = min(fetch_from_date(last_start, today), current_cycle_start(periods, today))
+        from_date = min(
+            fetch_from_date(last_start, today, self._backfill_months),
+            current_cycle_start(periods, today),
+        )
         if healing:
             heal_from = await self._full_reimport_from(meter_id)
-            from_date = min(from_date, heal_from or fetch_from_date(None, today))
+            from_date = min(
+                from_date, heal_from or fetch_from_date(None, today, self._backfill_months)
+            )
             LOGGER.info(
                 "Meter %s: re-importing its full history from %s to heal its statistics",
                 meter_id,
