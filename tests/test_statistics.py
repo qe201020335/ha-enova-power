@@ -24,6 +24,7 @@ from custom_components.enova_power.statistics import (
     SeriesScan,
     TieredRates,
     _async_import_series,
+    _changed_tail,
     _cycle_key,
     _merge_statistics,
     _missing_series,
@@ -568,6 +569,70 @@ async def test_import_series_rewrites_overlapping_window(
     # Sums re-derived from the anchor, replacing the stale rows in place.
     assert [s["sum"] for s in written] == [102.0, 105.0, 109.0]
     assert total == 109.0
+
+
+async def test_changed_tail_empty_when_chain_matches_stored() -> None:
+    chain = _merge_statistics([], 0.0, [], WINDOW, _covered())  # []
+    assert _changed_tail(chain, []) == []
+    chain = _merge_statistics(
+        [(_utc(5), 1.0), (_utc(6), 2.0)], 0.0, [], WINDOW, _covered(JAN1)
+    )
+    assert _changed_tail(chain, [(_utc(5), 1.0), (_utc(6), 3.0)]) == []
+
+
+async def test_changed_tail_starts_at_first_difference() -> None:
+    chain = _merge_statistics(
+        [(_utc(5), 1.0), (_utc(6), 2.0), (_utc(7), 3.0)], 0.0, [], WINDOW, _covered(JAN1)
+    )
+    tail = _changed_tail(chain, [(_utc(5), 1.0), (_utc(6), 2.5), (_utc(7), 5.5)])
+    assert [(s["start"], s["sum"]) for s in tail] == [(_utc(6), 3.0), (_utc(7), 6.0)]
+
+
+async def test_changed_tail_treats_unstored_hour_as_changed() -> None:
+    chain = _merge_statistics(
+        [(_utc(5), 1.0), (_utc(6), 2.0)], 0.0, [], WINDOW, _covered(JAN1)
+    )
+    tail = _changed_tail(chain, [(_utc(5), 1.0)])
+    assert [(s["start"], s["sum"]) for s in tail] == [(_utc(6), 3.0)]
+
+
+async def test_changed_tail_ignores_float_noise() -> None:
+    chain = _merge_statistics([(_utc(5), 0.1), (_utc(6), 0.2)], 0.0, [], WINDOW, _covered())
+    assert _changed_tail(chain, [(_utc(5), 0.1), (_utc(6), 0.3 + 1e-9)]) == []
+
+
+async def test_import_series_unchanged_window_writes_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The common cycle: the portal re-sends the same hours already stored.
+    anchor = {"start": _utc(4), "sum": 100.0}
+    stored = [(_utc(5), 102.0), (_utc(6), 105.0)]
+    written = _patch_import(monkeypatch, None, anchor=anchor, stored=stored)
+    assert await _import([(_utc(5), 2.0), (_utc(6), 3.0)]) == 105.0
+    assert written == []
+
+
+async def test_import_series_writes_only_from_the_revised_hour(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A revision in the middle of the window rewrites from that hour on only.
+    anchor = {"start": _utc(4), "sum": 100.0}
+    stored = [(_utc(5), 102.0), (_utc(6), 105.0), (_utc(7), 109.0)]
+    written = _patch_import(monkeypatch, None, anchor=anchor, stored=stored)
+    total = await _import([(_utc(5), 2.0), (_utc(6), 1.0), (_utc(7), 4.0)])
+    assert [(s["start"], s["sum"]) for s in written] == [(_utc(6), 103.0), (_utc(7), 107.0)]
+    assert total == 107.0
+
+
+async def test_import_series_appends_only_new_hours(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A newly published hour after unchanged stored ones is the only write.
+    anchor = {"start": _utc(4), "sum": 100.0}
+    stored = [(_utc(5), 102.0)]
+    written = _patch_import(monkeypatch, None, anchor=anchor, stored=stored)
+    assert await _import([(_utc(5), 2.0), (_utc(6), 3.0)]) == 105.0
+    assert [(s["start"], s["sum"]) for s in written] == [(_utc(6), 105.0)]
 
 
 async def test_import_series_overlap_without_anchor_starts_from_zero(
