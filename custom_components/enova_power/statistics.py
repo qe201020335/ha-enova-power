@@ -35,7 +35,9 @@ new points replace stored hours; a stored in-window hour on a covered day that
 the download no longer carries becomes a zero increment (so a revised tier
 split or a revised preliminary day can't leave stale plateaus behind); stored
 hours on uncovered days and rows after the window keep their stored increments,
-re-based on the new chain. This is idempotent when nothing changed, and it
+re-based on the new chain. Only rows from the first changed sum on are
+written (``_changed_tail``), so an unchanged cycle writes nothing. This is
+idempotent when nothing changed, and it
 heals the portal's publication pattern — a day first appears as a preliminary
 row with the whole total in the first hour slot and explicit zeros elsewhere,
 then gets revised to real hourly values a day later. History older than the
@@ -530,6 +532,27 @@ def _merge_statistics(
     return stats
 
 
+def _changed_tail(
+    stats: list[StatisticData],
+    stored: list[tuple[datetime, float]],
+    tolerance: float = 1e-6,
+) -> list[StatisticData]:
+    """The suffix of ``stats`` from the first row that differs from ``stored``.
+
+    A row differs when its hour isn't stored or its sum moved by more than
+    ``tolerance`` (float noise from re-deriving kept increments). Every row
+    after a change carries a shifted sum anyway, so writing from there keeps
+    the chain continuous while an unchanged cycle writes nothing — the window
+    is re-merged every update, but the portal only revises it about daily.
+    """
+    stored_sums = dict(stored)
+    for index, row in enumerate(stats):
+        stored_sum = stored_sums.get(row["start"])
+        if stored_sum is None or abs(row["sum"] - stored_sum) > tolerance:
+            return stats[index:]
+    return []
+
+
 async def _async_last_row(hass: HomeAssistant, statistic_id: str) -> dict | None:
     """Return the most recent stored statistic row for ``statistic_id``, or None."""
     last = await get_instance(hass).async_add_executor_job(
@@ -767,12 +790,17 @@ async def _async_import_series(
     def covered(start: datetime) -> bool:
         return start.astimezone(TIME_ZONE).date() in covered_days
 
-    stats = _merge_statistics(inside, base_sum, stored, window, covered)
-    if not stats:
+    chain = _merge_statistics(inside, base_sum, stored, window, covered)
+    if not chain:
         # Chain unchanged: the series still ends on its last stored sum.
         if stored:
             return SeriesResult(stored[-1][1], drops)
         return SeriesResult(base_sum if row else None, drops)
+    stats = _changed_tail(chain, stored)
+    if not stats:
+        # Re-derived chain matches what is stored row for row: skip the write.
+        LOGGER.debug("No changed statistics for %s", statistic_id)
+        return SeriesResult(chain[-1]["sum"], drops)
 
     # unit_class must be stated explicitly (required from HA 2026.11):
     # "energy" for kWh; None for units with no converter (currency).
