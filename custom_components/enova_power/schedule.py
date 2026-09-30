@@ -10,6 +10,7 @@ hardcoded rather than scraped.
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta
+from functools import cache
 
 from .const import (
     PERIOD_MID_PEAK,
@@ -65,19 +66,38 @@ def _nth_weekday(year: int, month: int, weekday: int, n: int) -> date:
     return first + timedelta(days=offset + 7 * (n - 1))
 
 
-def ontario_tou_holidays(year: int) -> set[date]:
-    """OEB statutory holidays that are off-peak all day for TOU/ULO pricing."""
-    return {
-        date(year, 1, 1),  # New Year's Day
-        _nth_weekday(year, 2, 0, 3),  # Family Day (3rd Mon Feb)
-        _easter(year) - timedelta(days=2),  # Good Friday
-        date(year, 5, 24) - timedelta(days=date(year, 5, 24).weekday()),  # Victoria Day
-        date(year, 7, 1),  # Canada Day
-        _nth_weekday(year, 9, 0, 1),  # Labour Day (1st Mon Sep)
-        _nth_weekday(year, 10, 0, 2),  # Thanksgiving (2nd Mon Oct)
-        date(year, 12, 25),  # Christmas Day
-        date(year, 12, 26),  # Boxing Day
-    }
+@cache
+def ontario_tou_holidays(year: int) -> frozenset[date]:
+    """OEB holidays that are off-peak all day for TOU/ULO pricing.
+
+    Per the OEB, a holiday falling on a weekend moves to the next weekday
+    that is not itself a holiday (so Christmas on a Sunday is observed on
+    Tuesday, after Boxing Day's Monday). The weekend dates stay in the set;
+    they are off-peak anyway. Cached: called once per classified hour.
+    """
+    actual = sorted(
+        {
+            date(year, 1, 1),  # New Year's Day
+            _nth_weekday(year, 2, 0, 3),  # Family Day (3rd Mon Feb)
+            _easter(year) - timedelta(days=2),  # Good Friday
+            date(year, 5, 24) - timedelta(days=date(year, 5, 24).weekday()),  # Victoria Day
+            date(year, 7, 1),  # Canada Day
+            _nth_weekday(year, 8, 0, 1),  # Civic Holiday (1st Mon Aug)
+            _nth_weekday(year, 9, 0, 1),  # Labour Day (1st Mon Sep)
+            _nth_weekday(year, 10, 0, 2),  # Thanksgiving (2nd Mon Oct)
+            date(year, 12, 25),  # Christmas Day
+            date(year, 12, 26),  # Boxing Day
+        }
+    )
+    observed = set(actual)
+    for holiday in actual:
+        if holiday.weekday() < 5:
+            continue
+        day = holiday
+        while day.weekday() >= 5 or day in observed:
+            day += timedelta(days=1)
+        observed.add(day)
+    return frozenset(observed)
 
 
 def current_period(now_local: datetime, plan: str) -> str:
