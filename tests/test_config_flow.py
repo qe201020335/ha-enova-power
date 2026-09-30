@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from unittest.mock import MagicMock, patch
+
 import pytest
 from enovapower import EnovaAuthError, EnovaNetworkError
 
@@ -86,3 +88,21 @@ async def test_user_flow_cannot_connect(hass: HomeAssistant, mock_client) -> Non
     )
     assert result["type"] is FlowResultType.FORM
     assert result["errors"] == {"base": "cannot_connect"}
+
+
+async def test_flow_detaches_its_session_instead_of_closing(
+    hass: HomeAssistant, mock_client
+) -> None:
+    """The flow's private session is detached, never closed (HA forbids close)."""
+    session = MagicMock()
+    with patch(
+        "custom_components.enova_power.config_flow.async_create_clientsession",
+        return_value=session,
+    ) as create:
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN, context={"source": config_entries.SOURCE_USER}
+        )
+        await hass.config_entries.flow.async_configure(result["flow_id"], USER_INPUT)
+    create.assert_called_once_with(hass, auto_cleanup=False)
+    session.detach.assert_called_once()
+    session.close.assert_not_called()
