@@ -695,7 +695,9 @@ def expected_statistic_ids(
 # July-2026-style sum drops and stale tier rows a stale/incomplete read could
 # leave behind, in place, from each meter's oldest stored date — history older
 # than the 12-month backfill window is never lost, since nothing is cleared.
-STATS_VERSION = 5
+# Version 6 = OEB holiday fixes (Civic Holiday, weekend holidays observed on
+# the next weekday): re-buckets those days' TOU/ULO kWh and costs in place.
+STATS_VERSION = 6
 
 
 def _missing_series(hass: HomeAssistant, ids: list[str]) -> list[str]:
