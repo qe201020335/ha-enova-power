@@ -65,7 +65,10 @@ class EnovaPowerConfigFlow(ConfigFlow, domain=DOMAIN):
         # async_get_clientsession. The portal returns a non-login page (no CSRF
         # token) when the jar already holds an authenticated session cookie, so a
         # jar shared across the config flow and setup makes the second login fail.
-        session = async_create_clientsession(self.hass)
+        # auto_cleanup=False: a flow has no entry to unload it with, so it would
+        # linger until shutdown; it's detached below instead. Never close() it —
+        # HA blocks that, since every session shares HA's connector.
+        session = async_create_clientsession(self.hass, auto_cleanup=False)
         client = AsyncEnovaClient(session=session)
         errors: dict[str, str] = {}
         account = username
@@ -81,7 +84,7 @@ class EnovaPowerConfigFlow(ConfigFlow, domain=DOMAIN):
             errors["base"] = "unknown"
         finally:
             await client.close()  # clears credentials; won't touch external session
-            await session.close()
+            session.detach()  # drops the logged-in cookie jar, keeps HA's connector
         return account, errors
 
     async def async_step_user(
