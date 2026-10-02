@@ -42,10 +42,12 @@ MAX_BACKFILL_MONTHS = 60
 # a deep backfill doesn't hit the portal back to back (up to ~20 chunks).
 CHUNK_DELAY_SECONDS = (2.0, 5.0)
 
-# Service action: re-run the backfill after setup (``months`` back, default the
-# entry's backfill depth).
+# Service action: re-run the backfill after setup, for the last ``months``
+# (default: the entry's backfill depth) or a ``start_date``..``end_date`` range.
 SERVICE_BACKFILL = "backfill"
 ATTR_MONTHS = "months"
+ATTR_START_DATE = "start_date"
+ATTR_END_DATE = "end_date"
 
 # How many recent days to re-fetch each cycle (portal data lags a few days).
 RECENT_DAYS = 5

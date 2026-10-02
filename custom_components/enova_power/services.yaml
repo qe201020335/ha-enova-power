@@ -13,3 +13,11 @@ backfill:
           max: 60
           mode: box
           unit_of_measurement: months
+    start_date:
+      required: false
+      selector:
+        date:
+    end_date:
+      required: false
+      selector:
+        date:
