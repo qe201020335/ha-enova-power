@@ -87,5 +87,25 @@
       "tier_1_rate": { "name": "Tier 1 rate" },
       "tier_2_rate": { "name": "Tier 2 rate" }
     }
+  },
+  "services": {
+    "backfill": {
+      "name": "Backfill history",
+      "description": "Re-imports the account's usage history from the portal in the background, reaching back the given number of months, or further if older history is already stored. Older costs are estimated at today's rates, and the total consumption sensor jumps by any newly imported history.",
+      "fields": {
+        "config_entry_id": {
+          "name": "Account",
+          "description": "The Enova Power account to backfill."
+        },
+        "months": {
+          "name": "Months",
+          "description": "How far back to import. Defaults to the depth chosen at setup."
+        }
+      }
+    }
+  },
+  "exceptions": {
+    "entry_not_found": { "message": "No Enova Power account found for that entry." },
+    "entry_not_loaded": { "message": "The Enova Power account is not loaded." }
   }
 }

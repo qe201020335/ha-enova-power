@@ -1,0 +1,15 @@
+backfill:
+  fields:
+    config_entry_id:
+      required: true
+      selector:
+        config_entry:
+          integration: enova_power
+    months:
+      required: false
+      selector:
+        number:
+          min: 1
+          max: 60
+          mode: box
+          unit_of_measurement: months
