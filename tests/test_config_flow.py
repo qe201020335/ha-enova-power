@@ -90,6 +90,21 @@ async def test_user_flow_cannot_connect(hass: HomeAssistant, mock_client) -> Non
     assert result["errors"] == {"base": "cannot_connect"}
 
 
+async def test_user_flow_no_meter(hass: HomeAssistant, mock_client) -> None:
+    """A login that finds no meter (e.g. the portal's lockout page) is refused."""
+    mock_client.meter_id = None
+    mock_client.meter_ids = []
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], USER_INPUT
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {"base": "no_meter"}
+    assert not hass.config_entries.async_entries(DOMAIN)
+
+
 async def test_flow_detaches_its_session_instead_of_closing(
     hass: HomeAssistant, mock_client
 ) -> None:
