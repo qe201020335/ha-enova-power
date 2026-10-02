@@ -31,12 +31,16 @@ LOGGER = logging.getLogger(__package__)
 # recommends not polling more often than every 15 minutes; 30 is comfortable.
 UPDATE_INTERVAL = timedelta(minutes=30)
 
-# How much history to pull on first setup (the library chunks >90-day ranges).
+# How much history to pull on first setup (downloaded in 90-day chunks).
 # Chosen per entry in the config flow; the default applies to entries created
 # before the option existed.
 CONF_BACKFILL_MONTHS = "backfill_months"
 DEFAULT_BACKFILL_MONTHS = 12
 MAX_BACKFILL_MONTHS = 60
+
+# Random pause between a long download's 90-day chunk requests, in seconds, so
+# a deep backfill doesn't hit the portal back to back (up to ~20 chunks).
+CHUNK_DELAY_SECONDS = (2.0, 5.0)
 
 # How many recent days to re-fetch each cycle (portal data lags a few days).
 RECENT_DAYS = 5

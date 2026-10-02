@@ -15,6 +15,15 @@ def auto_enable_custom_integrations(enable_custom_integrations):
     yield
 
 
+@pytest.fixture(autouse=True)
+def no_chunk_delay():
+    """Skip the pause between a long download's chunk requests."""
+    with patch(
+        "custom_components.enova_power.coordinator.sleep", new=AsyncMock()
+    ) as sleep:
+        yield sleep
+
+
 @pytest.fixture
 def mock_client():
     """Patch AsyncEnovaClient in the config flow with a logged-in mock."""

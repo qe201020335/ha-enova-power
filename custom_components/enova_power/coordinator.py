@@ -12,6 +12,8 @@ detection. The coordinator's ``data`` maps each meter id to its ``MeterData``.
 
 from __future__ import annotations
 
+import random
+from asyncio import sleep
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING
@@ -21,15 +23,18 @@ from enovapower import (
     BillingPeriod,
     EnovaAuthError,
     EnovaError,
+    EnovaNetworkError,
     TariffRate,
     UsageReading,
 )
+from enovapower.async_client import MAX_RANGE_DAYS
 
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import (
+    CHUNK_DELAY_SECONDS,
     CONF_BACKFILL_MONTHS,
     CONF_PLAN,
     CONF_STATS_VERSION,
@@ -229,7 +234,7 @@ class EnovaPowerCoordinator(DataUpdateCoordinator[dict[str, "MeterData"]]):
         ids = expected_statistic_ids(meter_id, plan, self.rates, tiered)
 
         from_date, healing = await self._download_from(meter_id, ids, periods, today)
-        readings = await self.client.download_usage(from_date, today, meter_id=meter_id)
+        readings = await self._download_usage(meter_id, from_date, today)
         result = await async_import_meter(
             self.hass,
             meter_id,
@@ -258,6 +263,67 @@ class EnovaPowerCoordinator(DataUpdateCoordinator[dict[str, "MeterData"]]):
             threshold=season_threshold(today) if plan == PLAN_TIERED else None,
             lifetime_energy=result.total,
         )
+
+    async def _download_usage(
+        self, meter_id: str, from_date: date, today: date
+    ) -> list[UsageReading]:
+        """Download ``[from_date, today]`` in portal-sized chunks, newest first.
+
+        The portal answers a range with no usage (before the subscriber moved
+        in, past what it keeps, or a gap in the middle) with an empty export,
+        which the library rejects as a malformed CSV. Skip such chunks and keep
+        the rest instead of failing the cycle, which would fail setup and lose
+        the history around the gap. Only every chunk failing fails the cycle,
+        and auth or network errors always do. Chunks are spaced by a random
+        pause (``CHUNK_DELAY_SECONDS``) so a deep backfill doesn't hammer the
+        portal.
+
+        The portal can also silently return less than asked: a range ending
+        today comes back as only its last 30 days. So each next chunk ends
+        the day before the earliest reading received, not before the chunk's
+        own start, and the days it left out are asked for again.
+        """
+        readings: list[UsageReading] = []
+        empty: list[tuple[date, date]] = []  # skipped ranges, newest first
+        error: EnovaError | None = None
+        fetched = False
+        chunk_end = today
+        while chunk_end >= from_date:
+            if chunk_end != today:
+                await sleep(random.uniform(*CHUNK_DELAY_SECONDS))
+            chunk_start = max(from_date, chunk_end - timedelta(days=MAX_RANGE_DAYS - 1))
+            try:
+                chunk = await self.client.download_usage(
+                    chunk_start, chunk_end, meter_id=meter_id
+                )
+            except (EnovaAuthError, EnovaNetworkError):
+                raise
+            except EnovaError as err:
+                error = error or err
+                # Merge with the adjacent newer gap: one entry per gap.
+                if empty and empty[-1][0] == chunk_end + timedelta(days=1):
+                    empty[-1] = (chunk_start, empty[-1][1])
+                else:
+                    empty.append((chunk_start, chunk_end))
+            else:
+                fetched = True
+                chunk = [r for r in chunk if chunk_start <= r.date <= chunk_end]
+                readings = chunk + readings
+                first = min((r.date for r in chunk), default=None)
+                if first is not None and chunk_start < first <= chunk_end:
+                    chunk_end = first - timedelta(days=1)  # ask for the rest
+                    continue
+            chunk_end = chunk_start - timedelta(days=1)
+        if error is not None:
+            if not fetched:
+                raise error
+            LOGGER.warning(
+                "Meter %s: the portal has no usage data for %s (%s); imported the rest",
+                meter_id,
+                ", ".join(f"{start} to {end}" for start, end in reversed(empty)),
+                error,
+            )
+        return readings
 
     async def _download_from(
         self, meter_id: str, ids: list[str], periods: list[BillingPeriod], today: date
