@@ -22,6 +22,7 @@ from homeassistant.helpers.aiohttp_client import async_create_clientsession
 from .const import (
     CONF_BACKFILL_MONTHS,
     CONF_PLAN,
+    CONF_STATS_VERSION,
     DEFAULT_BACKFILL_MONTHS,
     DEFAULT_PLAN,
     DOMAIN,
@@ -29,6 +30,7 @@ from .const import (
     MAX_BACKFILL_MONTHS,
     PLANS,
 )
+from .statistics import STATS_VERSION
 
 # The backfill depth only matters for the first import (and a series added by
 # an upgrade), so it is asked once here rather than offered as an option.
@@ -106,8 +108,12 @@ class EnovaPowerConfigFlow(ConfigFlow, domain=DOMAIN):
             if not errors:
                 await self.async_set_unique_id(account)
                 self._abort_if_unique_id_configured()
+                # A new entry writes the current statistics format, so it never
+                # needs the one-time repair — even when statistics from a
+                # removed entry are still stored (removing an entry keeps them).
                 return self.async_create_entry(
-                    title=user_input[CONF_USERNAME], data=user_input
+                    title=user_input[CONF_USERNAME],
+                    data={**user_input, CONF_STATS_VERSION: STATS_VERSION},
                 )
 
         return self.async_show_form(
