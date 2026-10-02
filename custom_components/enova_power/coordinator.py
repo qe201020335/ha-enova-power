@@ -12,6 +12,8 @@ detection. The coordinator's ``data`` maps each meter id to its ``MeterData``.
 
 from __future__ import annotations
 
+import random
+from asyncio import sleep
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING
@@ -32,6 +34,7 @@ from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import (
+    CHUNK_DELAY_SECONDS,
     CONF_BACKFILL_MONTHS,
     CONF_PLAN,
     CONF_STATS_VERSION,
@@ -271,7 +274,9 @@ class EnovaPowerCoordinator(DataUpdateCoordinator[dict[str, "MeterData"]]):
         which the library rejects as a malformed CSV. Skip such chunks and keep
         the rest instead of failing the cycle, which would fail setup and lose
         the history around the gap. Only every chunk failing fails the cycle,
-        and auth or network errors always do.
+        and auth or network errors always do. Chunks are spaced by a random
+        pause (``CHUNK_DELAY_SECONDS``) so a deep backfill doesn't hammer the
+        portal.
         """
         readings: list[UsageReading] = []
         empty: list[tuple[date, date]] = []  # skipped ranges, newest first
@@ -279,6 +284,8 @@ class EnovaPowerCoordinator(DataUpdateCoordinator[dict[str, "MeterData"]]):
         fetched = False
         chunk_end = today
         while chunk_end >= from_date:
+            if chunk_end != today:
+                await sleep(random.uniform(*CHUNK_DELAY_SECONDS))
             chunk_start = max(from_date, chunk_end - timedelta(days=MAX_RANGE_DAYS - 1))
             try:
                 chunk = await self.client.download_usage(

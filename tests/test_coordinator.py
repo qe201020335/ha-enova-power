@@ -14,6 +14,7 @@ from homeassistant.helpers.update_coordinator import UpdateFailed
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.enova_power.const import (
+    CHUNK_DELAY_SECONDS,
     CONF_BACKFILL_MONTHS,
     CONF_PLAN,
     CONF_STATS_VERSION,
@@ -232,6 +233,29 @@ async def test_download_usage_chunks_newest_first_within_portal_limit(
     assert [r.date for r in readings] == [
         from_date + timedelta(days=i) for i in range((today - from_date).days + 1)
     ]
+
+
+async def test_download_usage_pauses_randomly_between_chunks(
+    hass: HomeAssistant, no_chunk_delay: AsyncMock
+) -> None:
+    coord = _coordinator(hass)
+    download = _portal(coord, history_start=date(2020, 1, 1))
+
+    await coord._download_usage(METER, date(2025, 3, 1), TODAY)
+
+    # A pause between every two requests, none before the first.
+    assert no_chunk_delay.await_count == download.await_count - 1
+    low, high = CHUNK_DELAY_SECONDS
+    assert all(low <= c.args[0] <= high for c in no_chunk_delay.await_args_list)
+
+
+async def test_download_usage_single_chunk_does_not_pause(
+    hass: HomeAssistant, no_chunk_delay: AsyncMock
+) -> None:
+    coord = _coordinator(hass)
+    _portal(coord)
+    await coord._download_usage(METER, TODAY - timedelta(days=30), TODAY)
+    no_chunk_delay.assert_not_awaited()
 
 
 async def test_download_usage_skips_ranges_before_history_starts(
