@@ -234,28 +234,55 @@ async def test_download_usage_chunks_newest_first_within_portal_limit(
     ]
 
 
-async def test_download_usage_stops_where_portal_history_starts(
+async def test_download_usage_skips_ranges_before_history_starts(
     hass: HomeAssistant, caplog: pytest.LogCaptureFixture
 ) -> None:
     # A backfill reaching back before move-in: the portal returns an empty
-    # export for that range. Keep the history it does have instead of failing.
+    # export for those chunks. Keep the history it does have instead of failing.
     coord = _coordinator(hass)
     download = _portal(coord)
+    from_date = date(2024, 9, 1)
 
-    readings = await coord._download_usage(METER, date(2025, 3, 1), TODAY)
+    readings = await coord._download_usage(METER, from_date, TODAY)
 
     assert readings[0].date == MOVE_IN
     assert readings[-1].date == TODAY
-    # It stopped at the first empty chunk rather than asking for older ones.
-    assert download.call_args.args[1] < MOVE_IN
-    assert sum(1 for c in download.call_args_list if c.args[1] < MOVE_IN) == 1
-    assert f"Meter {METER}: no usage data from the portal" in caplog.text
+    assert download.call_args.args[0] == from_date  # every chunk was asked for
+    # The empty chunks are reported once, merged into one range.
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert f"Meter {METER}: the portal has no usage data for 2024-09-01 to 2025-04-21" in (
+        warnings[0]
+    )
 
 
-async def test_download_usage_newest_chunk_failure_still_fails(
+async def test_download_usage_keeps_history_on_both_sides_of_a_gap(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture
+) -> None:
+    coord = _coordinator(hass)
+    download = _portal(coord, history_start=date(2020, 1, 1))
+    portal = download.side_effect
+    gap = (date(2026, 1, 17), date(2026, 4, 16))  # exactly the second chunk
+
+    async def with_gap(start: date, end: date, *, meter_id: str) -> list:
+        if (start, end) == gap:
+            raise EMPTY_EXPORT
+        return await portal(start, end, meter_id=meter_id)
+
+    download.side_effect = with_gap
+    readings = await coord._download_usage(METER, date(2025, 3, 1), TODAY)
+
+    days = {r.date for r in readings}
+    assert date(2025, 3, 1) in days  # older than the gap: still imported
+    assert TODAY in days
+    assert not any(gap[0] <= d <= gap[1] for d in days)
+    assert "no usage data for 2026-01-17 to 2026-04-16" in caplog.text
+
+
+async def test_download_usage_fails_when_every_chunk_is_empty(
     hass: HomeAssistant,
 ) -> None:
-    # No data even for the latest chunk is a real problem, not a history start.
+    # No data anywhere in the window is a real problem, not a history start.
     coord = _coordinator(hass)
     _portal(coord, history_start=TODAY + timedelta(days=1))
     with pytest.raises(EnovaError):

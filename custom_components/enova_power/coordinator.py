@@ -266,16 +266,17 @@ class EnovaPowerCoordinator(DataUpdateCoordinator[dict[str, "MeterData"]]):
     ) -> list[UsageReading]:
         """Download ``[from_date, today]`` in portal-sized chunks, newest first.
 
-        A backfill can reach back before the meter has any history (the
-        subscriber moved in later, or the portal keeps less), and the portal
-        answers such a range with an empty export that the library rejects as
-        a malformed CSV. Walking backwards, the first chunk that fails that way
-        marks where history starts: keep everything newer instead of failing
-        the cycle (which would fail setup and retry with a fresh login each
-        time). The newest chunk failing still fails the cycle, and auth or
-        network errors always do.
+        The portal answers a range with no usage (before the subscriber moved
+        in, past what it keeps, or a gap in the middle) with an empty export,
+        which the library rejects as a malformed CSV. Skip such chunks and keep
+        the rest instead of failing the cycle, which would fail setup and lose
+        the history around the gap. Only every chunk failing fails the cycle,
+        and auth or network errors always do.
         """
         readings: list[UsageReading] = []
+        empty: list[tuple[date, date]] = []  # skipped ranges, newest first
+        error: EnovaError | None = None
+        fetched = False
         chunk_end = today
         while chunk_end >= from_date:
             chunk_start = max(from_date, chunk_end - timedelta(days=MAX_RANGE_DAYS - 1))
@@ -286,20 +287,25 @@ class EnovaPowerCoordinator(DataUpdateCoordinator[dict[str, "MeterData"]]):
             except (EnovaAuthError, EnovaNetworkError):
                 raise
             except EnovaError as err:
-                if chunk_end == today:
-                    raise
-                LOGGER.warning(
-                    "Meter %s: no usage data from the portal for %s to %s (%s); "
-                    "importing history from %s on",
-                    meter_id,
-                    chunk_start,
-                    chunk_end,
-                    err,
-                    chunk_end + timedelta(days=1),
-                )
-                break
-            readings = chunk + readings
+                error = error or err
+                # Merge with the adjacent newer gap: one entry per gap.
+                if empty and empty[-1][0] == chunk_end + timedelta(days=1):
+                    empty[-1] = (chunk_start, empty[-1][1])
+                else:
+                    empty.append((chunk_start, chunk_end))
+            else:
+                fetched = True
+                readings = chunk + readings
             chunk_end = chunk_start - timedelta(days=1)
+        if error is not None:
+            if not fetched:
+                raise error
+            LOGGER.warning(
+                "Meter %s: the portal has no usage data for %s (%s); imported the rest",
+                meter_id,
+                ", ".join(f"{start} to {end}" for start, end in reversed(empty)),
+                error,
+            )
         return readings
 
     async def _download_from(
