@@ -15,7 +15,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers.aiohttp_client import async_create_clientsession
 
-from .const import CONF_STATS_VERSION, LOGGER
+from .const import CONF_STATS_VERSION, DOMAIN, LOGGER
 from .coordinator import EnovaPowerCoordinator
 from .statistics import STATS_VERSION
 
@@ -66,19 +66,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: EnovaPowerConfigEntry) -
         )
 
     coordinator = EnovaPowerCoordinator(hass, entry, client)
-    await coordinator.async_config_entry_first_refresh()
-
     entry.runtime_data = coordinator
-    entry.async_on_unload(entry.add_update_listener(_async_update_listener))
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    # The first refresh runs after setup instead of gating it: on a new entry
+    # it is the full history backfill, which would hold the config flow's
+    # dialog open for its whole duration. Sensors stay unavailable until it
+    # lands. A failure here doesn't fail setup either (HA would retry setup
+    # with a fresh login each time, which trips the portal's login lockout);
+    # the coordinator retries on its normal interval with this session, and
+    # an auth failure still starts re-authentication.
+    entry.async_create_background_task(
+        hass, coordinator.async_refresh(), f"{DOMAIN} first refresh"
+    )
     return True
-
-
-async def _async_update_listener(
-    hass: HomeAssistant, entry: EnovaPowerConfigEntry
-) -> None:
-    """Reload the entry when options (e.g. the pricing plan) change."""
-    await hass.config_entries.async_reload(entry.entry_id)
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: EnovaPowerConfigEntry) -> bool:
