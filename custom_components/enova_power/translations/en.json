@@ -10,7 +10,7 @@
           "backfill_months": "History to import (months)"
         },
         "data_description": {
-          "backfill_months": "How many months of past usage to download on first setup. The portal may keep less; older costs are estimated at today's rates. Can't be changed later without re-adding the integration."
+          "backfill_months": "How many months of past usage to download on first setup. The portal may keep less; older costs are estimated at today's rates. To import more later, run the Backfill history action."
         }
       },
       "reauth_confirm": {
