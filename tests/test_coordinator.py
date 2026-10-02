@@ -7,7 +7,7 @@ from datetime import date, datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from enovapower import BillingPeriod, EnovaError
+from enovapower import BillingPeriod, EnovaAuthError, EnovaError, EnovaNetworkError
 
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import UpdateFailed
@@ -191,6 +191,95 @@ async def test_incremental_start_fresh_meter_skips_missing_series_check(
 
     assert await coord._incremental_start("111", ["enova_power:x"]) is None
     missing.assert_not_awaited()
+
+
+# --- chunked download ---------------------------------------------------------- #
+
+MOVE_IN = date(2025, 6, 15)  # the meter's first day of portal history
+EMPTY_EXPORT = EnovaError("Unrecognized CSV header: expected at least 25 columns, got 0")
+
+
+def _portal(coord: EnovaPowerCoordinator, history_start: date = MOVE_IN) -> AsyncMock:
+    """Stub ``download_usage`` like the portal: one reading per day from
+    ``history_start`` on, and an empty export for a range wholly before it."""
+
+    async def download_usage(start: date, end: date, *, meter_id: str) -> list:
+        if end < history_start:
+            raise EMPTY_EXPORT
+        first = max(start, history_start)
+        return [_reading(first + timedelta(days=i), h01=1.0) for i in range((end - first).days + 1)]
+
+    coord.client.download_usage = AsyncMock(side_effect=download_usage)
+    return coord.client.download_usage
+
+
+async def test_download_usage_chunks_newest_first_within_portal_limit(
+    hass: HomeAssistant,
+) -> None:
+    coord = _coordinator(hass)
+    download = _portal(coord, history_start=date(2020, 1, 1))
+    from_date, today = date(2025, 3, 1), date(2026, 7, 15)
+
+    readings = await coord._download_usage(METER, from_date, today)
+
+    chunks = [c.args[:2] for c in download.call_args_list]
+    assert chunks[0][1] == today
+    assert chunks[-1][0] == from_date
+    for (start, end), (_, older_end) in zip(chunks, chunks[1:]):
+        assert older_end == start - timedelta(days=1)  # contiguous, no overlap
+    assert all((end - start).days < 90 for start, end in chunks)
+    # One reading per day, oldest first, nothing duplicated.
+    assert [r.date for r in readings] == [
+        from_date + timedelta(days=i) for i in range((today - from_date).days + 1)
+    ]
+
+
+async def test_download_usage_stops_where_portal_history_starts(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A backfill reaching back before move-in: the portal returns an empty
+    # export for that range. Keep the history it does have instead of failing.
+    coord = _coordinator(hass)
+    download = _portal(coord)
+
+    readings = await coord._download_usage(METER, date(2025, 3, 1), TODAY)
+
+    assert readings[0].date == MOVE_IN
+    assert readings[-1].date == TODAY
+    # It stopped at the first empty chunk rather than asking for older ones.
+    assert download.call_args.args[1] < MOVE_IN
+    assert sum(1 for c in download.call_args_list if c.args[1] < MOVE_IN) == 1
+    assert f"Meter {METER}: no usage data from the portal" in caplog.text
+
+
+async def test_download_usage_newest_chunk_failure_still_fails(
+    hass: HomeAssistant,
+) -> None:
+    # No data even for the latest chunk is a real problem, not a history start.
+    coord = _coordinator(hass)
+    _portal(coord, history_start=TODAY + timedelta(days=1))
+    with pytest.raises(EnovaError):
+        await coord._download_usage(METER, date(2025, 3, 1), TODAY)
+
+
+@pytest.mark.parametrize(
+    "error", [EnovaAuthError("expired"), EnovaNetworkError("down")], ids=["auth", "network"]
+)
+async def test_download_usage_older_chunk_auth_or_network_error_propagates(
+    hass: HomeAssistant, error: EnovaError
+) -> None:
+    coord = _coordinator(hass)
+    download = _portal(coord)
+    newest = download.side_effect
+
+    async def fail_older(start: date, end: date, *, meter_id: str) -> list:
+        if end < TODAY:
+            raise error
+        return await newest(start, end, meter_id=meter_id)
+
+    download.side_effect = fail_older
+    with pytest.raises(type(error)):
+        await coord._download_usage(METER, date(2025, 3, 1), TODAY)
 
 
 # --- integrity check + heal state machine ------------------------------------- #

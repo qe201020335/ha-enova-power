@@ -21,9 +21,11 @@ from enovapower import (
     BillingPeriod,
     EnovaAuthError,
     EnovaError,
+    EnovaNetworkError,
     TariffRate,
     UsageReading,
 )
+from enovapower.async_client import MAX_RANGE_DAYS
 
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed
@@ -229,7 +231,7 @@ class EnovaPowerCoordinator(DataUpdateCoordinator[dict[str, "MeterData"]]):
         ids = expected_statistic_ids(meter_id, plan, self.rates, tiered)
 
         from_date, healing = await self._download_from(meter_id, ids, periods, today)
-        readings = await self.client.download_usage(from_date, today, meter_id=meter_id)
+        readings = await self._download_usage(meter_id, from_date, today)
         result = await async_import_meter(
             self.hass,
             meter_id,
@@ -258,6 +260,47 @@ class EnovaPowerCoordinator(DataUpdateCoordinator[dict[str, "MeterData"]]):
             threshold=season_threshold(today) if plan == PLAN_TIERED else None,
             lifetime_energy=result.total,
         )
+
+    async def _download_usage(
+        self, meter_id: str, from_date: date, today: date
+    ) -> list[UsageReading]:
+        """Download ``[from_date, today]`` in portal-sized chunks, newest first.
+
+        A backfill can reach back before the meter has any history (the
+        subscriber moved in later, or the portal keeps less), and the portal
+        answers such a range with an empty export that the library rejects as
+        a malformed CSV. Walking backwards, the first chunk that fails that way
+        marks where history starts: keep everything newer instead of failing
+        the cycle (which would fail setup and retry with a fresh login each
+        time). The newest chunk failing still fails the cycle, and auth or
+        network errors always do.
+        """
+        readings: list[UsageReading] = []
+        chunk_end = today
+        while chunk_end >= from_date:
+            chunk_start = max(from_date, chunk_end - timedelta(days=MAX_RANGE_DAYS - 1))
+            try:
+                chunk = await self.client.download_usage(
+                    chunk_start, chunk_end, meter_id=meter_id
+                )
+            except (EnovaAuthError, EnovaNetworkError):
+                raise
+            except EnovaError as err:
+                if chunk_end == today:
+                    raise
+                LOGGER.warning(
+                    "Meter %s: no usage data from the portal for %s to %s (%s); "
+                    "importing history from %s on",
+                    meter_id,
+                    chunk_start,
+                    chunk_end,
+                    err,
+                    chunk_end + timedelta(days=1),
+                )
+                break
+            readings = chunk + readings
+            chunk_end = chunk_start - timedelta(days=1)
+        return readings
 
     async def _download_from(
         self, meter_id: str, ids: list[str], periods: list[BillingPeriod], today: date
