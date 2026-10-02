@@ -277,6 +277,11 @@ class EnovaPowerCoordinator(DataUpdateCoordinator[dict[str, "MeterData"]]):
         and auth or network errors always do. Chunks are spaced by a random
         pause (``CHUNK_DELAY_SECONDS``) so a deep backfill doesn't hammer the
         portal.
+
+        The portal can also silently return less than asked: a range ending
+        today comes back as only its last 30 days. So each next chunk ends
+        the day before the earliest reading received, not before the chunk's
+        own start, and the days it left out are asked for again.
         """
         readings: list[UsageReading] = []
         empty: list[tuple[date, date]] = []  # skipped ranges, newest first
@@ -302,7 +307,12 @@ class EnovaPowerCoordinator(DataUpdateCoordinator[dict[str, "MeterData"]]):
                     empty.append((chunk_start, chunk_end))
             else:
                 fetched = True
+                chunk = [r for r in chunk if chunk_start <= r.date <= chunk_end]
                 readings = chunk + readings
+                first = min((r.date for r in chunk), default=None)
+                if first is not None and chunk_start < first <= chunk_end:
+                    chunk_end = first - timedelta(days=1)  # ask for the rest
+                    continue
             chunk_end = chunk_start - timedelta(days=1)
         if error is not None:
             if not fetched:

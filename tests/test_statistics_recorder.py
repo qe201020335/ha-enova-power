@@ -398,9 +398,11 @@ async def test_DW_2_4_startup_scan_heals_break_outside_window(
 
     # The next cycle is back on the normal window (Jul 13 →, overlapping the
     # stored Jul 15 rows so the check runs), finds the chain clean: no error.
+    # (A follow-up request for Jul 13-14, which the download left out, may follow.)
+    coord.client.download_usage.reset_mock()
     await coord._update_meter(METER, today, None)
     await async_wait_recording_done(hass)
-    assert coord.client.download_usage.call_args.args[:2] == (date(2026, 7, 13), today)
+    assert coord.client.download_usage.call_args_list[0].args[:2] == (date(2026, 7, 13), today)
     assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
     assert coord._pre_heal == {}
     assert coord._unhealable == set()

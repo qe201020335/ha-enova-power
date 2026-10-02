@@ -156,8 +156,10 @@ async def test_DW_1_5_update_meter_downloads_whole_cycles_and_reaches_back_once(
             today - timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc
         )
         client.billing_periods.return_value = periods
+        client.download_usage.reset_mock()
         await coord._update_meter("111", today, None)
-        return client.download_usage.call_args.args[:2]
+        # The cycle's main request (a follow-up may ask for days it left out).
+        return client.download_usage.call_args_list[0].args[:2]
 
     # Steady state inside the open cycle (Jun 20 →): the whole open cycle,
     # not just the recent days and not back to the month start.
@@ -275,7 +277,8 @@ async def test_download_usage_skips_ranges_before_history_starts(
     # The empty chunks are reported once, merged into one range.
     warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
     assert len(warnings) == 1
-    assert f"Meter {METER}: the portal has no usage data for 2024-09-01 to 2025-04-21" in (
+    # Includes the days before move-in in the chunk that holds it.
+    assert f"Meter {METER}: the portal has no usage data for 2024-09-01 to 2025-06-14" in (
         warnings[0]
     )
 
@@ -301,6 +304,41 @@ async def test_download_usage_keeps_history_on_both_sides_of_a_gap(
     assert TODAY in days
     assert not any(gap[0] <= d <= gap[1] for d in days)
     assert "no usage data for 2026-01-17 to 2026-04-16" in caplog.text
+
+
+async def test_download_usage_asks_again_for_days_the_portal_left_out(
+    hass: HomeAssistant,
+) -> None:
+    # The real portal answers a range ending today with only its last 30 days.
+    coord = _coordinator(hass)
+    download = _portal(coord, history_start=date(2020, 1, 1))
+    portal = download.side_effect
+
+    async def last_30_days_when_ending_today(start: date, end: date, *, meter_id: str) -> list:
+        if end == TODAY:
+            start = max(start, TODAY - timedelta(days=30))
+        return await portal(start, end, meter_id=meter_id)
+
+    download.side_effect = last_30_days_when_ending_today
+    from_date = date(2026, 1, 1)
+    readings = await coord._download_usage(METER, from_date, TODAY)
+
+    assert [r.date for r in readings] == [
+        from_date + timedelta(days=i) for i in range((TODAY - from_date).days + 1)
+    ]
+    # The follow-up starts right before the first day the portal returned.
+    assert download.call_args_list[1].args[1] == TODAY - timedelta(days=31)
+
+
+async def test_download_usage_ignores_days_outside_the_requested_range(
+    hass: HomeAssistant,
+) -> None:
+    coord = _coordinator(hass)
+    coord.client.download_usage = AsyncMock(
+        return_value=[_reading(TODAY - timedelta(days=200), h01=1.0), _reading(TODAY, h01=1.0)]
+    )
+    readings = await coord._download_usage(METER, TODAY - timedelta(days=10), TODAY)
+    assert [r.date for r in readings] == [TODAY]
 
 
 async def test_download_usage_fails_when_every_chunk_is_empty(
