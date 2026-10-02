@@ -206,8 +206,8 @@ class EnovaPowerCoordinator(DataUpdateCoordinator[dict[str, "MeterData"]]):
             raise UpdateFailed(str(err)) from err
         if self._rebuild:
             # Every meter repaired; record it so the next setup doesn't repair
-            # again. Runs before the entry's update listener is registered
-            # (first refresh), so no reload is triggered.
+            # again. A data-only update: options changes are what reload the
+            # entry (OptionsFlowWithReload), so this doesn't trigger one.
             self._rebuild = False
             entry = self.config_entry
             self.hass.config_entries.async_update_entry(

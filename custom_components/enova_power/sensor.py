@@ -217,13 +217,14 @@ class EnovaMeterSensor(CoordinatorEntity[EnovaPowerCoordinator], SensorEntity):
 
     @property
     def available(self) -> bool:
+        # Unavailable until the first refresh (it runs after setup) has data.
         # Tier sensors only apply on the Tiered plan (threshold is set then);
         # mark them unavailable elsewhere instead of showing "Unknown".
-        if not super().available:
+        data = self._data
+        if not super().available or data is None:
             return False
         if self.entity_description.key in ("current_tier", "kwh_to_tier_2"):
-            data = self._data
-            return data is not None and data.threshold is not None
+            return data.threshold is not None
         return True
 
     @property
@@ -261,6 +262,11 @@ class _MeterHourlyEntity(CoordinatorEntity[EnovaPowerCoordinator], SensorEntity)
     def _meter(self) -> MeterData | None:
         data = self.coordinator.data
         return data.get(self._meter_id) if data else None
+
+    @property
+    def available(self) -> bool:
+        # Unavailable until the first refresh (it runs after setup) has data.
+        return super().available and self._meter is not None
 
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
@@ -337,6 +343,11 @@ class EnovaRateSensor(CoordinatorEntity[EnovaPowerCoordinator], SensorEntity):
         self._attr_translation_key = key
         self._attr_unique_id = f"{entry_id}_{key}"
         self._attr_device_info = _account_device(entry_id)
+
+    @property
+    def available(self) -> bool:
+        # Unavailable until the first refresh (it runs after setup) has data.
+        return super().available and self.coordinator.data is not None
 
     @property
     def native_value(self) -> float | None:

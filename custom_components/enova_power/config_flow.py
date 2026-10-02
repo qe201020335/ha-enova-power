@@ -13,6 +13,7 @@ from homeassistant.config_entries import (
     ConfigFlow,
     ConfigFlowResult,
     OptionsFlow,
+    OptionsFlowWithReload,
 )
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import callback
@@ -137,8 +138,8 @@ class EnovaPowerConfigFlow(ConfigFlow, domain=DOMAIN):
         )
 
 
-class EnovaPowerOptionsFlow(OptionsFlow):
-    """Handle Enova Power options (pricing plan)."""
+class EnovaPowerOptionsFlow(OptionsFlowWithReload):
+    """Handle Enova Power options (pricing plan); a change reloads the entry."""
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
