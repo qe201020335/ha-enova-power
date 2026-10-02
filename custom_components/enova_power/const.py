@@ -73,3 +73,8 @@ CURRENCY = "CAD"
 # Config-entry data key recording which statistics format the entry's series
 # were last imported with (see statistics.STATS_VERSION).
 CONF_STATS_VERSION = "stats_version"
+
+# Config-entry data flag: the entry's chosen backfill depth still has to be
+# applied once. Set on new entries; cleared after their first successful
+# refresh. It matters when a removed entry's statistics are still stored.
+CONF_INITIAL_BACKFILL = "initial_backfill"

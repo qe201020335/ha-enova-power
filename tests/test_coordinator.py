@@ -16,6 +16,7 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 from custom_components.enova_power.const import (
     CHUNK_DELAY_SECONDS,
     CONF_BACKFILL_MONTHS,
+    CONF_INITIAL_BACKFILL,
     CONF_PLAN,
     CONF_STATS_VERSION,
     DEFAULT_BACKFILL_MONTHS,
@@ -751,3 +752,86 @@ async def test_request_backfill_defaults_to_entry_depth_and_refreshes(
 
     assert coord._backfill_request == 18
     refresh.assert_awaited_once()
+
+
+# --- a new entry's initial backfill --------------------------------------------- #
+
+
+def _new_entry_coordinator(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch, months: int, **kwargs
+) -> tuple[EnovaPowerCoordinator, AsyncMock]:
+    """A just-created entry (initial backfill pending) choosing ``months``;
+    stored history (if any) starts at OLDEST."""
+    coord, import_meter, _ = _healing_coordinator(
+        hass,
+        monkeypatch,
+        data={CONF_BACKFILL_MONTHS: months, CONF_INITIAL_BACKFILL: True},
+        **kwargs,
+    )
+    _freeze_today(monkeypatch, TODAY)
+    return coord, import_meter
+
+
+async def test_initial_backfill_extends_shorter_stored_history(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A removed entry left history from 2025-07-01; the new one wants 24 months.
+    coord, _ = _new_entry_coordinator(hass, monkeypatch, 24)
+
+    await coord._async_update_data()
+
+    expected = cycle_start_containing([], TODAY - timedelta(days=24 * 31))
+    assert expected < OLDEST
+    assert coord.client.download_usage.call_args.args[0] == expected
+    assert coord.config_entry.data[CONF_INITIAL_BACKFILL] is False
+
+    # Once only: the next cycle is normal.
+    await coord._async_update_data()
+    assert coord.client.download_usage.call_args.args[0] == NORMAL_FROM
+
+
+async def test_initial_backfill_leaves_longer_stored_history_alone(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Stored history already reaches past 6 months back: no full re-import.
+    coord, _ = _new_entry_coordinator(hass, monkeypatch, 6)
+
+    await coord._async_update_data()
+
+    assert coord.client.download_usage.call_args.args[0] == NORMAL_FROM
+    assert coord._last_heal == {}
+    assert coord.config_entry.data[CONF_INITIAL_BACKFILL] is False
+
+
+async def test_initial_backfill_on_empty_recorder_is_the_normal_backfill(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    coord, _ = _new_entry_coordinator(
+        hass, monkeypatch, 6, scan={CONS: SeriesScan(None, [])}
+    )
+    monkeypatch.setattr(
+        coordinator_module, "async_last_statistic_start", AsyncMock(return_value=None)
+    )
+
+    await coord._async_update_data()
+
+    expected = cycle_start_containing([], TODAY - timedelta(days=6 * 31))
+    assert coord.client.download_usage.call_args.args[0] == expected
+    assert coord._last_heal == {}  # a plain backfill, not a heal
+    assert coord.config_entry.data[CONF_INITIAL_BACKFILL] is False
+
+
+async def test_initial_backfill_retries_until_a_cycle_succeeds(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    coord, _ = _new_entry_coordinator(hass, monkeypatch, 24)
+    coord.client.download_usage.side_effect = EnovaError("portal down")
+    with pytest.raises(UpdateFailed):
+        await coord._async_update_data()
+    assert coord.config_entry.data[CONF_INITIAL_BACKFILL] is True
+
+    coord.client.download_usage.side_effect = None
+    await coord._async_update_data()
+    expected = cycle_start_containing([], TODAY - timedelta(days=24 * 31))
+    assert coord.client.download_usage.call_args.args[0] == expected
+    assert coord.config_entry.data[CONF_INITIAL_BACKFILL] is False

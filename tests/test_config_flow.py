@@ -14,6 +14,7 @@ from homeassistant.data_entry_flow import FlowResultType, InvalidData
 
 from custom_components.enova_power.const import (
     CONF_BACKFILL_MONTHS,
+    CONF_INITIAL_BACKFILL,
     CONF_STATS_VERSION,
     DEFAULT_BACKFILL_MONTHS,
     DOMAIN,
@@ -37,8 +38,10 @@ async def test_user_flow_success(hass: HomeAssistant, mock_client) -> None:
     assert result["title"] == USER_INPUT[CONF_USERNAME]
     assert result["result"].unique_id == "1234567890"
     assert result["data"][CONF_BACKFILL_MONTHS] == DEFAULT_BACKFILL_MONTHS
-    # A new entry starts at the current statistics format: no repair cycle.
+    # A new entry starts at the current statistics format: no repair cycle,
+    # and its chosen depth is applied once by the first refresh.
     assert result["data"][CONF_STATS_VERSION] == STATS_VERSION
+    assert result["data"][CONF_INITIAL_BACKFILL] is True
     mock_client.login.assert_awaited_once()
 
 

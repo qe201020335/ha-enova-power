@@ -36,6 +36,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from .const import (
     CHUNK_DELAY_SECONDS,
     CONF_BACKFILL_MONTHS,
+    CONF_INITIAL_BACKFILL,
     CONF_PLAN,
     CONF_STATS_VERSION,
     CURRENCY,
@@ -220,35 +221,45 @@ class EnovaPowerCoordinator(DataUpdateCoordinator[dict[str, "MeterData"]]):
         # A requested backfill gets this one cycle; a request arriving while
         # it runs waits for the next.
         backfill, self._backfill_request = self._backfill_request, None
+        # A new entry applies its chosen depth once, only reaching further back
+        # than history already stored; retried until a cycle succeeds.
+        initial = backfill is None and self.config_entry.data.get(
+            CONF_INITIAL_BACKFILL, False
+        )
+        if initial:
+            backfill = self._backfill_months
         try:
             self.rates = await self._fetch_rates(today)
             tiered = tiered_rates(self.rates)
             for meter_id in self.client.meter_ids:
                 data[meter_id] = await self._update_meter(
-                    meter_id, today, tiered, backfill
+                    meter_id, today, tiered, backfill, extend_only=initial
                 )
         except EnovaAuthError as err:  # also covers EnovaSessionExpiredError
             raise ConfigEntryAuthFailed(str(err)) from err
         except EnovaError as err:  # also covers EnovaNetworkError + parse/form errors
-            if backfill is not None:
+            if backfill is not None and not initial:
                 LOGGER.warning(
                     "Backfill of %d months failed (%s); run the backfill action again",
                     backfill,
                     err,
                 )
             raise UpdateFailed(str(err)) from err
-        if backfill is not None:
+        if backfill is not None and not initial:
             LOGGER.info("Backfill of %d months complete", backfill)
+        # Data-only updates: options changes are what reload the entry
+        # (OptionsFlowWithReload), so recording these doesn't trigger one.
+        updates: dict[str, int | bool] = {}
+        if initial:
+            updates[CONF_INITIAL_BACKFILL] = False
         if self._rebuild:
-            # Every meter repaired; record it so the next setup doesn't repair
-            # again. A data-only update: options changes are what reload the
-            # entry (OptionsFlowWithReload), so this doesn't trigger one.
+            # Every meter repaired; record it so the next setup doesn't repair again.
             self._rebuild = False
-            entry = self.config_entry
-            self.hass.config_entries.async_update_entry(
-                entry, data={**entry.data, CONF_STATS_VERSION: STATS_VERSION}
-            )
+            updates[CONF_STATS_VERSION] = STATS_VERSION
             LOGGER.info("Statistics repair complete (v%s)", STATS_VERSION)
+        if updates:
+            entry = self.config_entry
+            self.hass.config_entries.async_update_entry(entry, data={**entry.data, **updates})
         return data
 
     async def _update_meter(
@@ -257,9 +268,12 @@ class EnovaPowerCoordinator(DataUpdateCoordinator[dict[str, "MeterData"]]):
         today: date,
         tiered: TieredRates | None,
         backfill_months: int | None = None,
+        *,
+        extend_only: bool = False,
     ) -> MeterData:
         """Fetch, import, and summarize a single meter (``backfill_months``:
-        a requested backfill, see ``async_request_backfill``)."""
+        a requested backfill, see ``async_request_backfill``; ``extend_only``:
+        a new entry's initial one, see ``_download_from``)."""
         plan = await self._meter_plan(meter_id)
         try:
             periods = await self.client.billing_periods(meter_id)
@@ -269,7 +283,7 @@ class EnovaPowerCoordinator(DataUpdateCoordinator[dict[str, "MeterData"]]):
         ids = expected_statistic_ids(meter_id, plan, self.rates, tiered)
 
         from_date, healing = await self._download_from(
-            meter_id, ids, periods, today, backfill_months
+            meter_id, ids, periods, today, backfill_months, extend_only=extend_only
         )
         readings = await self._download_usage(meter_id, from_date, today)
         result = await async_import_meter(
@@ -369,6 +383,8 @@ class EnovaPowerCoordinator(DataUpdateCoordinator[dict[str, "MeterData"]]):
         periods: list[BillingPeriod],
         today: date,
         backfill_months: int | None = None,
+        *,
+        extend_only: bool = False,
     ) -> tuple[date, bool]:
         """This cycle's download start date, and whether it is a heal cycle.
 
@@ -386,10 +402,18 @@ class EnovaPowerCoordinator(DataUpdateCoordinator[dict[str, "MeterData"]]):
         the startup scan still runs first so ``_full_reimport_from`` has an
         oldest date to work from (see heal rule 3). A requested backfill
         (``backfill_months``) is a heal too, reaching back at least that far.
+        With ``extend_only`` (a new entry's initial backfill) it only runs
+        when the meter's stored history starts later than that: with nothing
+        stored the normal backfill covers it, and history already reaching
+        that far is not re-imported.
         """
         last_start = await self._incremental_start(meter_id, ids)
         if meter_id not in self._scanned:
             await self._startup_scan(meter_id, ids)
+        if backfill_months is not None and extend_only:
+            oldest = self._oldest.get(meter_id)
+            if oldest is None or oldest <= fetch_from_date(None, today, backfill_months):
+                backfill_months = None
         healing = (
             backfill_months is not None
             or self._rebuild
