@@ -10,7 +10,7 @@
           "backfill_months": "History to import (months)"
         },
         "data_description": {
-          "backfill_months": "How many months of past usage to download on first setup. The portal may keep less; older costs are estimated at today's rates. Can't be changed later without re-adding the integration."
+          "backfill_months": "How many months of past usage to download on first setup. The portal may keep less; older costs are estimated at today's rates. To import more later, run the Backfill history action."
         }
       },
       "reauth_confirm": {
@@ -87,5 +87,33 @@
       "tier_1_rate": { "name": "Tier 1 rate" },
       "tier_2_rate": { "name": "Tier 2 rate" }
     }
+  },
+  "services": {
+    "backfill": {
+      "name": "Backfill history",
+      "description": "Re-imports the account's usage from the portal in the background, for the last given number of months or for a date range. Stored history outside that range is kept. Older costs are estimated at today's rates, and the total consumption sensor jumps by any newly imported history.",
+      "fields": {
+        "config_entry_id": {
+          "name": "Account",
+          "description": "The Enova Power account to backfill."
+        },
+        "months": {
+          "name": "Months",
+          "description": "Import the last this many months. Defaults to the depth chosen at setup. Leave empty when giving a start date."
+        },
+        "start_date": {
+          "name": "Start date",
+          "description": "First day of a date range to import, instead of a number of months."
+        },
+        "end_date": {
+          "name": "End date",
+          "description": "Last day of the date range. Defaults to today."
+        }
+      }
+    }
+  },
+  "exceptions": {
+    "entry_not_found": { "message": "No Enova Power account found for that entry." },
+    "entry_not_loaded": { "message": "The Enova Power account is not loaded." }
   }
 }

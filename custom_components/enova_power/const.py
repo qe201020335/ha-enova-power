@@ -42,6 +42,13 @@ MAX_BACKFILL_MONTHS = 60
 # a deep backfill doesn't hit the portal back to back (up to ~20 chunks).
 CHUNK_DELAY_SECONDS = (2.0, 5.0)
 
+# Service action: re-run the backfill after setup, for the last ``months``
+# (default: the entry's backfill depth) or a ``start_date``..``end_date`` range.
+SERVICE_BACKFILL = "backfill"
+ATTR_MONTHS = "months"
+ATTR_START_DATE = "start_date"
+ATTR_END_DATE = "end_date"
+
 # How many recent days to re-fetch each cycle (portal data lags a few days).
 RECENT_DAYS = 5
 
@@ -68,3 +75,8 @@ CURRENCY = "CAD"
 # Config-entry data key recording which statistics format the entry's series
 # were last imported with (see statistics.STATS_VERSION).
 CONF_STATS_VERSION = "stats_version"
+
+# Config-entry data flag: the entry's chosen backfill depth still has to be
+# applied once. Set on new entries; cleared after their first successful
+# refresh. It matters when a removed entry's statistics are still stored.
+CONF_INITIAL_BACKFILL = "initial_backfill"

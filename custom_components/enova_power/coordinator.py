@@ -29,13 +29,14 @@ from enovapower import (
 )
 from enovapower.async_client import MAX_RANGE_DAYS
 
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import (
     CHUNK_DELAY_SECONDS,
     CONF_BACKFILL_MONTHS,
+    CONF_INITIAL_BACKFILL,
     CONF_PLAN,
     CONF_STATS_VERSION,
     CURRENCY,
@@ -130,6 +131,26 @@ def cycle_start_containing(periods: list[BillingPeriod], d: date) -> date:
     return month_start
 
 
+def cycle_end_containing(periods: list[BillingPeriod], d: date) -> date:
+    """Last day of the tier-split group containing ``d`` (the mirror of
+    ``cycle_start_containing``).
+
+    Inside a known billing cycle that's the cycle's read date. Days outside
+    every known cycle are split by calendar month, so reach forward to the end
+    of ``d``'s month — but never into the next known cycle, which starts the
+    day after its ``start_date`` (the previous read date). A backfill range
+    ending here re-imports whole groups, keeping the tier split stable.
+    """
+    for p in periods:
+        if p.start_date < d <= p.end_date:
+            return p.end_date
+    month_end = (d.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
+    opened_after = [p.start_date for p in periods if p.start_date >= d]
+    if opened_after and min(opened_after) <= month_end:
+        return min(opened_after)
+    return month_end
+
+
 def _drop_set(broken: dict[str, list[datetime]]) -> set[tuple[str, datetime]]:
     """Flatten ``{statistic_id: [drop hours]}`` into ``(statistic_id, hour)`` pairs."""
     return {(statistic_id, start) for statistic_id, starts in broken.items() for start in starts}
@@ -157,6 +178,8 @@ class EnovaPowerCoordinator(DataUpdateCoordinator[dict[str, "MeterData"]]):
         self._backfill_months: int = entry.data.get(
             CONF_BACKFILL_MONTHS, DEFAULT_BACKFILL_MONTHS
         )
+        # Local date range requested by the backfill action, run by the next refresh.
+        self._backfill_request: tuple[date, date] | None = None
         # Account-wide scraped tariff rates (all plans), refreshed each cycle and
         # read by the rate-card and current-rate sensors. Empty until first fetch.
         self.rates: list[TariffRate] = []
@@ -180,6 +203,31 @@ class EnovaPowerCoordinator(DataUpdateCoordinator[dict[str, "MeterData"]]):
         # drops that survived a heal: logged as ERROR once, never healed again
         self._unhealable: set[tuple[str, datetime]] = set()
 
+    @callback
+    def async_request_backfill(
+        self,
+        *,
+        months: int | None = None,
+        start: date | None = None,
+        end: date | None = None,
+    ) -> None:
+        """Re-import every meter's usage for ``start..end`` (``end`` defaults
+        to today), or else for the last ``months`` (default: the entry's
+        backfill depth), and start that refresh now in the background.
+
+        The range is imported in place alongside the normal window (see
+        ``_update_meter``): nothing is cleared, and history outside it is kept.
+        One attempt only; if it fails, the action has to be run again.
+        """
+        today = date.today()
+        if start is None:
+            start = today - timedelta(days=(months or self._backfill_months) * 31)
+        self._backfill_request = (start, end or today)
+        LOGGER.info("Backfill of %s to %s requested", *self._backfill_request)
+        self.config_entry.async_create_background_task(
+            self.hass, self.async_request_refresh(), f"{DOMAIN} backfill"
+        )
+
     def plan_override(self) -> str | None:
         """Account-wide plan override (options, or a legacy configured value)."""
         entry = self.config_entry
@@ -200,31 +248,71 @@ class EnovaPowerCoordinator(DataUpdateCoordinator[dict[str, "MeterData"]]):
         """Fetch + import each meter; return per-meter state for the sensors."""
         today = date.today()
         data: dict[str, MeterData] = {}
+        # A requested backfill gets this one cycle; a request arriving while
+        # it runs waits for the next.
+        backfill, self._backfill_request = self._backfill_request, None
+        # A new entry applies its chosen depth once, only reaching further back
+        # than history already stored; retried until a cycle succeeds.
+        initial = backfill is None and self.config_entry.data.get(
+            CONF_INITIAL_BACKFILL, False
+        )
+        if initial:
+            backfill = (fetch_from_date(None, today, self._backfill_months), today)
         try:
             self.rates = await self._fetch_rates(today)
             tiered = tiered_rates(self.rates)
             for meter_id in self.client.meter_ids:
-                data[meter_id] = await self._update_meter(meter_id, today, tiered)
+                data[meter_id] = await self._update_meter(
+                    meter_id, today, tiered, backfill, extend_only=initial
+                )
         except EnovaAuthError as err:  # also covers EnovaSessionExpiredError
             raise ConfigEntryAuthFailed(str(err)) from err
         except EnovaError as err:  # also covers EnovaNetworkError + parse/form errors
+            if backfill is not None and not initial:
+                LOGGER.warning(
+                    "Backfill of %s to %s failed (%s); run the backfill action again",
+                    *backfill,
+                    err,
+                )
             raise UpdateFailed(str(err)) from err
+        if backfill is not None and not initial:
+            LOGGER.info("Backfill of %s to %s complete", *backfill)
+        # Data-only updates: options changes are what reload the entry
+        # (OptionsFlowWithReload), so recording these doesn't trigger one.
+        updates: dict[str, int | bool] = {}
+        if initial:
+            updates[CONF_INITIAL_BACKFILL] = False
         if self._rebuild:
-            # Every meter repaired; record it so the next setup doesn't repair
-            # again. A data-only update: options changes are what reload the
-            # entry (OptionsFlowWithReload), so this doesn't trigger one.
+            # Every meter repaired; record it so the next setup doesn't repair again.
             self._rebuild = False
-            entry = self.config_entry
-            self.hass.config_entries.async_update_entry(
-                entry, data={**entry.data, CONF_STATS_VERSION: STATS_VERSION}
-            )
+            updates[CONF_STATS_VERSION] = STATS_VERSION
             LOGGER.info("Statistics repair complete (v%s)", STATS_VERSION)
+        if updates:
+            entry = self.config_entry
+            self.hass.config_entries.async_update_entry(entry, data={**entry.data, **updates})
         return data
 
     async def _update_meter(
-        self, meter_id: str, today: date, tiered: TieredRates | None
+        self,
+        meter_id: str,
+        today: date,
+        tiered: TieredRates | None,
+        backfill: tuple[date, date] | None = None,
+        *,
+        extend_only: bool = False,
     ) -> MeterData:
-        """Fetch, import, and summarize a single meter."""
+        """Fetch, import, and summarize a single meter.
+
+        ``backfill`` is a requested local date range (see
+        ``async_request_backfill``), widened to whole billing cycles. Whatever
+        of it lies before this cycle's normal window is downloaded too, and
+        both are imported as one window from the backfill's start: stored days
+        between them weren't downloaded, so they keep their values and are
+        only re-based. With ``extend_only`` (a new entry's initial backfill)
+        it runs only when the meter's stored history starts later than the
+        range: with nothing stored the normal backfill already covers it, and
+        history already reaching that far is not re-imported.
+        """
         plan = await self._meter_plan(meter_id)
         try:
             periods = await self.client.billing_periods(meter_id)
@@ -235,6 +323,22 @@ class EnovaPowerCoordinator(DataUpdateCoordinator[dict[str, "MeterData"]]):
 
         from_date, healing = await self._download_from(meter_id, ids, periods, today)
         readings = await self._download_usage(meter_id, from_date, today)
+        window_start = from_date
+        if backfill is not None and extend_only:
+            oldest = self._oldest.get(meter_id)
+            if oldest is None or oldest <= backfill[0]:
+                backfill = None
+        if backfill is not None:
+            start = cycle_start_containing(periods, backfill[0])
+            end = min(
+                cycle_end_containing(periods, backfill[1]), from_date - timedelta(days=1)
+            )
+            if start <= end:
+                LOGGER.info("Meter %s: backfilling %s to %s", meter_id, start, end)
+                older = await self._download_backfill(meter_id, start, end)
+                if older:
+                    readings = older + readings
+                    window_start = start
         result = await async_import_meter(
             self.hass,
             meter_id,
@@ -244,7 +348,7 @@ class EnovaPowerCoordinator(DataUpdateCoordinator[dict[str, "MeterData"]]):
             tiered,
             periods,
             CURRENCY,
-            window=download_window(from_date, today),
+            window=download_window(window_start, today),
             covered_days=days_covered(readings),
         )
         if healing:
@@ -264,10 +368,29 @@ class EnovaPowerCoordinator(DataUpdateCoordinator[dict[str, "MeterData"]]):
             lifetime_energy=result.total,
         )
 
-    async def _download_usage(
-        self, meter_id: str, from_date: date, today: date
+    async def _download_backfill(
+        self, meter_id: str, start: date, end: date
     ) -> list[UsageReading]:
-        """Download ``[from_date, today]`` in portal-sized chunks, newest first.
+        """Download a backfill range; a range with no usage at all (e.g. before
+        move-in) is logged and skipped rather than failing the whole cycle."""
+        try:
+            return await self._download_usage(meter_id, start, end)
+        except (EnovaAuthError, EnovaNetworkError):
+            raise
+        except EnovaError as err:
+            LOGGER.warning(
+                "Meter %s: the portal has no usage data for %s to %s (%s)",
+                meter_id,
+                start,
+                end,
+                err,
+            )
+            return []
+
+    async def _download_usage(
+        self, meter_id: str, from_date: date, to_date: date
+    ) -> list[UsageReading]:
+        """Download ``[from_date, to_date]`` in portal-sized chunks, newest first.
 
         The portal answers a range with no usage (before the subscriber moved
         in, past what it keeps, or a gap in the middle) with an empty export,
@@ -287,9 +410,9 @@ class EnovaPowerCoordinator(DataUpdateCoordinator[dict[str, "MeterData"]]):
         empty: list[tuple[date, date]] = []  # skipped ranges, newest first
         error: EnovaError | None = None
         fetched = False
-        chunk_end = today
+        chunk_end = to_date
         while chunk_end >= from_date:
-            if chunk_end != today:
+            if chunk_end != to_date:
                 await sleep(random.uniform(*CHUNK_DELAY_SECONDS))
             chunk_start = max(from_date, chunk_end - timedelta(days=MAX_RANGE_DAYS - 1))
             try:
@@ -326,7 +449,11 @@ class EnovaPowerCoordinator(DataUpdateCoordinator[dict[str, "MeterData"]]):
         return readings
 
     async def _download_from(
-        self, meter_id: str, ids: list[str], periods: list[BillingPeriod], today: date
+        self,
+        meter_id: str,
+        ids: list[str],
+        periods: list[BillingPeriod],
+        today: date,
     ) -> tuple[date, bool]:
         """This cycle's download start date, and whether it is a heal cycle.
 
