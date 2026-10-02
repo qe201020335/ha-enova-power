@@ -28,6 +28,7 @@ from custom_components.enova_power.const import (
 import custom_components.enova_power.coordinator as coordinator_module
 from custom_components.enova_power.coordinator import (
     EnovaPowerCoordinator,
+    cycle_end_containing,
     cycle_start_containing,
     fetch_from_date,
 )
@@ -693,34 +694,134 @@ async def test_DW_3_3_fresh_install_backfills_and_stamps_version(
 # --- requested backfill (the backfill action) ---------------------------------- #
 
 
-async def test_requested_backfill_reaches_back_and_runs_once(
+async def test_cycle_end_containing_boundaries() -> None:
+    # Inside a known cycle: its read date.
+    assert cycle_end_containing([P1, P2], date(2026, 6, 20)) == date(2026, 7, 20)
+    assert cycle_end_containing([P1, P2], date(2026, 6, 19)) == date(2026, 6, 19)
+    # Outside every cycle: the month end...
+    assert cycle_end_containing([], date(2026, 2, 10)) == date(2026, 2, 28)
+    assert cycle_end_containing([P1, P2], date(2026, 7, 25)) == date(2026, 7, 31)
+    # ...but never into the next known cycle (it starts after May 19).
+    assert cycle_end_containing([P1, P2], date(2026, 5, 3)) == date(2026, 5, 19)
+
+
+def _calls(coord: EnovaPowerCoordinator) -> list[tuple[date, date]]:
+    return [c.args[:2] for c in coord.client.download_usage.call_args_list]
+
+
+def _backfill_span(coord: EnovaPowerCoordinator) -> tuple[date, date]:
+    """The range the backfill downloads covered (every call after the cycle's
+    normal window, which comes first; a range over 90 days takes two)."""
+    calls = _calls(coord)[1:]
+    return min(start for start, _ in calls), max(end for _, end in calls)
+
+
+def _one_reading_per_call(coord: EnovaPowerCoordinator) -> None:
+    coord.client.download_usage.side_effect = lambda start, end, *, meter_id: [
+        _reading(start, h01=1.0)
+    ]
+
+
+async def test_requested_backfill_imports_only_its_range_with_the_normal_window(
     hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Stored history starts 2025-07-01; a 24-month request reaches past it.
-    coord, _import_meter, _ = _healing_coordinator(hass, monkeypatch)
+    # A 3-month request inside stored history (from 2025-07-01): no re-import
+    # from the oldest stored date, and no heal.
+    coord, import_meter, _ = _healing_coordinator(hass, monkeypatch)
     _freeze_today(monkeypatch, TODAY)
-    coord._backfill_request = 24
+    _one_reading_per_call(coord)
+    coord._backfill_request = (TODAY - timedelta(days=3 * 31), TODAY)
 
     await coord._async_update_data()
-    expected = cycle_start_containing([], TODAY - timedelta(days=24 * 31))
-    assert expected < OLDEST
-    assert coord.client.download_usage.call_args.args[0] == expected
-    assert coord._last_heal == {METER: TODAY}
+
+    # The normal window, then the rest of the range before it (whole months).
+    assert _calls(coord)[0] == (NORMAL_FROM, TODAY)
+    assert _backfill_span(coord) == (date(2026, 4, 1), date(2026, 6, 30))
+    window = import_meter.call_args.kwargs["window"]
+    assert window == download_window(date(2026, 4, 1), TODAY)
+    assert coord._last_heal == {}
+    assert coord._backfill_request is None
 
     # Done: the next cycle is a normal one.
+    coord.client.download_usage.reset_mock()
     await coord._async_update_data()
-    assert coord.client.download_usage.call_args.args[0] == NORMAL_FROM
+    assert _calls(coord) == [(NORMAL_FROM, TODAY)]
 
 
-async def test_requested_backfill_shorter_than_stored_history_starts_at_oldest(
+async def test_requested_backfill_reaches_past_stored_history(
     hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    coord, _import_meter, _ = _healing_coordinator(hass, monkeypatch)
+    coord, import_meter, _ = _healing_coordinator(hass, monkeypatch)
     _freeze_today(monkeypatch, TODAY)
-    coord._backfill_request = 3
+    _one_reading_per_call(coord)
+    coord._backfill_request = (TODAY - timedelta(days=24 * 31), TODAY)
 
     await coord._async_update_data()
-    assert coord.client.download_usage.call_args.args[0] == OLDEST
+
+    expected = cycle_start_containing([], TODAY - timedelta(days=24 * 31))
+    assert expected < OLDEST
+    assert _backfill_span(coord) == (expected, NORMAL_FROM - timedelta(days=1))
+    assert import_meter.call_args.kwargs["window"] == download_window(expected, TODAY)
+
+
+async def test_requested_backfill_custom_range_in_the_past(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Only the requested months (widened to whole months) are downloaded; the
+    # stored days between them and the normal window are kept, not covered.
+    coord, import_meter, _ = _healing_coordinator(hass, monkeypatch)
+    _freeze_today(monkeypatch, TODAY)
+    _one_reading_per_call(coord)
+    coord._backfill_request = (date(2025, 10, 10), date(2025, 12, 20))
+
+    await coord._async_update_data()
+
+    assert _calls(coord)[0] == (NORMAL_FROM, TODAY)
+    assert _backfill_span(coord) == (date(2025, 10, 1), date(2025, 12, 31))
+    kwargs = import_meter.call_args.kwargs
+    assert kwargs["window"] == download_window(date(2025, 10, 1), TODAY)
+    # Only downloaded days count as covered; the stored days in between are kept.
+    downloaded = {start for start, _ in _calls(coord)}
+    assert kwargs["covered_days"] == downloaded
+
+
+async def test_requested_backfill_with_no_data_skips_it_and_keeps_the_cycle(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A range before move-in: the portal has nothing, the normal cycle goes on.
+    coord, import_meter, _ = _healing_coordinator(hass, monkeypatch)
+    _freeze_today(monkeypatch, TODAY)
+
+    async def download_usage(start: date, end: date, *, meter_id: str) -> list:
+        if end < OLDEST:
+            raise EMPTY_EXPORT
+        return []
+
+    coord.client.download_usage.side_effect = download_usage
+    coord._backfill_request = (date(2024, 1, 1), date(2024, 3, 31))
+
+    await coord._async_update_data()
+
+    assert "the portal has no usage data for 2024-01-01 to 2024-03-31" in caplog.text
+    assert import_meter.call_args.kwargs["window"] == download_window(NORMAL_FROM, TODAY)
+
+
+async def test_requested_backfill_network_error_fails_the_cycle(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Unlike an empty export, a network error is not "no data there".
+    coord, _import_meter, _ = _healing_coordinator(hass, monkeypatch)
+    _freeze_today(monkeypatch, TODAY)
+
+    async def download_usage(start: date, end: date, *, meter_id: str) -> list:
+        if end < NORMAL_FROM:
+            raise EnovaNetworkError("down")
+        return []
+
+    coord.client.download_usage.side_effect = download_usage
+    coord._backfill_request = (date(2025, 10, 1), date(2025, 12, 31))
+    with pytest.raises(UpdateFailed):
+        await coord._async_update_data()
 
 
 async def test_requested_backfill_gets_one_attempt(
@@ -728,30 +829,39 @@ async def test_requested_backfill_gets_one_attempt(
 ) -> None:
     coord, _import_meter, _ = _healing_coordinator(hass, monkeypatch)
     _freeze_today(monkeypatch, TODAY)
-    coord._backfill_request = 24
+    coord._backfill_request = (date(2025, 1, 1), TODAY)
     coord.client.download_usage.side_effect = EnovaError("portal down")
 
     with pytest.raises(UpdateFailed):
         await coord._async_update_data()
-    assert "Backfill of 24 months failed" in caplog.text
+    assert f"Backfill of 2025-01-01 to {TODAY} failed" in caplog.text
 
     coord.client.download_usage.side_effect = None
+    coord.client.download_usage.reset_mock()
     await coord._async_update_data()
-    assert coord.client.download_usage.call_args.args[0] == NORMAL_FROM
+    assert _calls(coord) == [(NORMAL_FROM, TODAY)]
 
 
-async def test_request_backfill_defaults_to_entry_depth_and_refreshes(
+async def test_request_backfill_ranges(
     hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     coord = _coordinator(hass, data={CONF_BACKFILL_MONTHS: 18})
+    _freeze_today(monkeypatch, TODAY)
     refresh = AsyncMock()
     monkeypatch.setattr(coord, "async_request_refresh", refresh)
 
-    coord.async_request_backfill()
+    coord.async_request_backfill()  # the entry's depth, up to today
     await hass.async_block_till_done(wait_background_tasks=True)
-
-    assert coord._backfill_request == 18
+    assert coord._backfill_request == (TODAY - timedelta(days=18 * 31), TODAY)
     refresh.assert_awaited_once()
+
+    coord.async_request_backfill(months=3)
+    assert coord._backfill_request == (TODAY - timedelta(days=3 * 31), TODAY)
+    coord.async_request_backfill(start=date(2025, 10, 1))
+    assert coord._backfill_request == (date(2025, 10, 1), TODAY)
+    coord.async_request_backfill(start=date(2025, 10, 1), end=date(2025, 12, 31))
+    assert coord._backfill_request == (date(2025, 10, 1), date(2025, 12, 31))
+    await hass.async_block_till_done(wait_background_tasks=True)
 
 
 # --- a new entry's initial backfill --------------------------------------------- #

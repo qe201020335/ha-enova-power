@@ -37,6 +37,6 @@ def async_setup_services(hass: HomeAssistant) -> None:
             raise ServiceValidationError(
                 translation_domain=DOMAIN, translation_key="entry_not_loaded"
             )
-        entry.runtime_data.async_request_backfill(call.data.get(ATTR_MONTHS))
+        entry.runtime_data.async_request_backfill(months=call.data.get(ATTR_MONTHS))
 
     hass.services.async_register(DOMAIN, SERVICE_BACKFILL, backfill, schema=BACKFILL_SCHEMA)

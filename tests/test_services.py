@@ -46,7 +46,7 @@ async def test_backfill_requests_it_on_the_entry(
         data[ATTR_MONTHS] = months
     with patch.object(EnovaPowerCoordinator, "async_request_backfill") as request:
         await hass.services.async_call(DOMAIN, SERVICE_BACKFILL, data, blocking=True)
-    request.assert_called_once_with(expected)
+    request.assert_called_once_with(months=expected)
 
 
 async def test_backfill_unknown_entry(hass: HomeAssistant) -> None:

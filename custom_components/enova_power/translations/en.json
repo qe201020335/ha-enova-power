@@ -91,7 +91,7 @@
   "services": {
     "backfill": {
       "name": "Backfill history",
-      "description": "Re-imports the account's usage history from the portal in the background, reaching back the given number of months, or further if older history is already stored. Older costs are estimated at today's rates, and the total consumption sensor jumps by any newly imported history.",
+      "description": "Re-imports the account's usage for the last given number of months from the portal, in the background. Stored history outside that range is kept. Older costs are estimated at today's rates, and the total consumption sensor jumps by any newly imported history.",
       "fields": {
         "config_entry_id": {
           "name": "Account",
