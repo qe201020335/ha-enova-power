@@ -1,4 +1,8 @@
 # Enova Power for Home Assistant
+> [!WARNING]
+> This fork contains more vibe-coded fixes and enhancements. Use it at your own risk.
+>
+> I (qe201020335) may cherry-pick and contribute the changes here once I have tested them in my own HA instance. 
 
 [![hacs](https://img.shields.io/badge/HACS-Custom-41BDF5.svg)](https://hacs.xyz/)
 
@@ -6,7 +10,7 @@
 
 A Home Assistant integration that reports household electricity consumption from the
 [Enova Power](https://enovapower.com) My Account portal (Kitchener-Waterloo, Ontario). It is
-a thin wrapper over the [`enovapower`](https://github.com/mojo17/enovapower) library and
+a thin wrapper over the [`enovapower`](https://github.com/qe201020335/enovapower) library and
 feeds your hourly usage into Home Assistant **long-term statistics**, so it appears natively
 in the **Energy dashboard** with full history.
 
@@ -14,7 +18,7 @@ in the **Energy dashboard** with full history.
 
 Enova publishes smart-meter data a few days in arrears, so this integration does **not** use a
 live consumption sensor (which couldn't backfill history). Instead it imports hourly usage as
-external [long-term statistics](#long-term-statistics), backfilling ~12 months (configurable at setup) on first setup
+external [long-term statistics](#long-term-statistics), backfilling months of data (configurable at setup) on first setup
 and topping up every 30 minutes, and complements them with [per-meter
 sensors](#devices-and-sensors) for at-a-glance state and automations. Every meter on the
 account gets its own device and statistics series.
@@ -25,10 +29,10 @@ Requires [HACS](https://hacs.xyz). The integration is awaiting review for the
 HACS default store; until then it installs as a custom repository — one extra
 click, same result, including automatic updates.
 
-[![Open your Home Assistant instance and show the add custom repository dialog with this repository pre-filled.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=mojo17&repository=ha-enova-power&category=integration)
+[![Open your Home Assistant instance and show the add custom repository dialog with this repository pre-filled.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=qe201020335&repository=ha-enova-power&category=integration)
 
 1. Click the badge above — or, in HACS, open **⋮ → Custom repositories** and add
-   `https://github.com/mojo17/ha-enova-power` with type **Integration**.
+   `https://github.com/qe201020335/ha-enova-power` with type **Integration**.
 2. Press **Download** on the Enova Power page that opens, then restart
    Home Assistant.
 3. Set up the integration and sign in with your Enova Power My Account
@@ -36,17 +40,8 @@ click, same result, including automatic updates.
 
    [![Open your Home Assistant instance and start setting up this integration.](https://my.home-assistant.io/badges/config_flow_start.svg)](https://my.home-assistant.io/redirect/config_flow_start/?domain=enova_power)
 
-   (or **Settings → Devices & Services → Add integration → Enova Power**).
+   (or **Settings → Devices & Services → Add integration → Enova Power Sky's Fork**).
 
-<details>
-<summary>Manual installation (without HACS)</summary>
-
-Download the latest [release](https://github.com/mojo17/ha-enova-power/releases/latest)
-source archive, copy `custom_components/enova_power/` into your Home Assistant
-`config/custom_components/` directory, and restart Home Assistant. You won't
-get update notifications this way — HACS is recommended.
-
-</details>
 
 ## Configuration
 
