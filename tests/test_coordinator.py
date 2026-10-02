@@ -687,3 +687,67 @@ async def test_DW_3_3_fresh_install_backfills_and_stamps_version(
     backfill = cycle_start_containing([], fetch_from_date(None, TODAY))
     assert coord.client.download_usage.call_args.args[0] == backfill
     assert coord.config_entry.data[CONF_STATS_VERSION] == STATS_VERSION
+
+
+# --- requested backfill (the backfill action) ---------------------------------- #
+
+
+async def test_requested_backfill_reaches_back_and_runs_once(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Stored history starts 2025-07-01; a 24-month request reaches past it.
+    coord, _import_meter, _ = _healing_coordinator(hass, monkeypatch)
+    _freeze_today(monkeypatch, TODAY)
+    coord._backfill_request = 24
+
+    await coord._async_update_data()
+    expected = cycle_start_containing([], TODAY - timedelta(days=24 * 31))
+    assert expected < OLDEST
+    assert coord.client.download_usage.call_args.args[0] == expected
+    assert coord._last_heal == {METER: TODAY}
+
+    # Done: the next cycle is a normal one.
+    await coord._async_update_data()
+    assert coord.client.download_usage.call_args.args[0] == NORMAL_FROM
+
+
+async def test_requested_backfill_shorter_than_stored_history_starts_at_oldest(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    coord, _import_meter, _ = _healing_coordinator(hass, monkeypatch)
+    _freeze_today(monkeypatch, TODAY)
+    coord._backfill_request = 3
+
+    await coord._async_update_data()
+    assert coord.client.download_usage.call_args.args[0] == OLDEST
+
+
+async def test_requested_backfill_gets_one_attempt(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    coord, _import_meter, _ = _healing_coordinator(hass, monkeypatch)
+    _freeze_today(monkeypatch, TODAY)
+    coord._backfill_request = 24
+    coord.client.download_usage.side_effect = EnovaError("portal down")
+
+    with pytest.raises(UpdateFailed):
+        await coord._async_update_data()
+    assert "Backfill of 24 months failed" in caplog.text
+
+    coord.client.download_usage.side_effect = None
+    await coord._async_update_data()
+    assert coord.client.download_usage.call_args.args[0] == NORMAL_FROM
+
+
+async def test_request_backfill_defaults_to_entry_depth_and_refreshes(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    coord = _coordinator(hass, data={CONF_BACKFILL_MONTHS: 18})
+    refresh = AsyncMock()
+    monkeypatch.setattr(coord, "async_request_refresh", refresh)
+
+    coord.async_request_backfill()
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    assert coord._backfill_request == 18
+    refresh.assert_awaited_once()
