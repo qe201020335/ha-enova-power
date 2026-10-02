@@ -75,6 +75,12 @@ class EnovaPowerConfigFlow(ConfigFlow, domain=DOMAIN):
         try:
             await client.login(username, password)
             account = client.account_number or username
+            # The library treats any non-login page as success, including the
+            # portal's "too many login attempts" lockout page. Without a meter
+            # the entry could only fail setup and retry-loop more logins, so
+            # refuse here instead.
+            if not client.meter_id:
+                errors["base"] = "no_meter"
         except EnovaAuthError:
             errors["base"] = "invalid_auth"
         except EnovaNetworkError:

@@ -25,6 +25,7 @@
     "error": {
       "invalid_auth": "Invalid authentication",
       "cannot_connect": "Failed to connect",
+      "no_meter": "Signed in, but no meter was found. The portal may be blocking logins after too many attempts; wait at least 5 minutes and try again.",
       "unknown": "Unexpected error"
     },
     "abort": {
